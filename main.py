@@ -227,196 +227,91 @@ def compute_eos(eos_name, rho_arr, P_arr):
     }
 
 def compute_inertia(m, r):
-    """Compute moment of inertia with detailed debugging"""
-    try:
-        print(f"DEBUG inertia: m shape: {m.shape}, r shape: {r.shape}")
-        print(f"DEBUG inertia: m range: {m.min():.3f} to {m.max():.3f}")
-        print(f"DEBUG inertia: r range: {r.min():.3f} to {r.max():.3f}")
-        
-        # Check for division by zero issues
-        if np.any(r == 0):
-            print("WARNING: Zero radius detected in inertia calculation")
-            r = np.where(r == 0, 1e-10, r)  # Replace zeros with small value
-        
-        # Check m/r ratio to avoid large values
-        m_r_ratio = m / r
-        print(f"DEBUG inertia: m/r ratio range: {m_r_ratio.min():.3f} to {m_r_ratio.max():.3f}")
-        
-        # The inertia formula
-        inertia = (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*m_r_ratio + 90*m_r_ratio**4) / 1e45
-        
-        print(f"DEBUG inertia: result range: {inertia.min():.3f} to {inertia.max():.3f}")
-        print(f"DEBUG inertia: NaN count: {np.sum(np.isnan(inertia))}, Inf count: {np.sum(np.isinf(inertia))}")
-        
-        return inertia
-        
-    except Exception as e:
-        print(f"ERROR in compute_inertia: {e}")
-        import traceback
-        traceback.print_exc()
-        return np.zeros_like(m)
+    """Compute moment of inertia"""
+    return (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*(m/r) + 90*(m/r)**4) / 1e45
 
 def create_plot(results, plot_type):
-    """Create Plotly figure based on plot type with proper error handling"""
-    try:
-        fig = go.Figure()
-        
-        if not results:
-            # Return empty plot if no results
-            fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-            return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
-        
-        if plot_type == 'mass-rho':
-            for result in results:
-                if 'rho' in result and 'M' in result and len(result['rho']) > 0 and len(result['M']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['rho'],
-                        y=result['M'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Mass vs Central Density',
-                xaxis_title='ρc (g/cm³)',
-                yaxis_title='Mass (M☉)',
-                xaxis_type='log',
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'radius-rho':
-            for result in results:
-                if 'rho' in result and 'R' in result and len(result['rho']) > 0 and len(result['R']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['rho'],
-                        y=result['R'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Radius vs Central Density',
-                xaxis_title='ρc (g/cm³)',
-                yaxis_title='Radius (km)',
-                xaxis_type='log',
-                yaxis=dict(range=[9, 30]),
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'mass-radius':
-            for result in results:
-                if 'R' in result and 'M' in result and len(result['R']) > 0 and len(result['M']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['R'],
-                        y=result['M'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Mass vs Radius',
-                xaxis_title='Radius (km)',
-                yaxis_title='Mass (M☉)',
-                xaxis=dict(range=[8, 20]),
-                yaxis=dict(range=[0, 3]),
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'inertia':
-            print(f"DEBUG: Creating inertia plot with {len(results)} results")
-            
-            for result in results:
-                try:
-                    print(f"DEBUG inertia: Processing {result['name']}")
-                    
-                    M = np.array(result['M'])
-                    R = np.array(result['R'])
-                    
-                    print(f"DEBUG inertia {result['name']}: Total points: {len(M)}")
-                    
-                    # Find stable branch (up to maximum mass)
-                    max_idx = np.argmax(M)
-                    M_stable = M[:max_idx+1]
-                    R_stable = R[:max_idx+1]
-                    
-                    print(f"DEBUG inertia {result['name']}: Stable branch points: {len(M_stable)}")
-                    
-                    if len(M_stable) < 2:
-                        print(f"DEBUG inertia {result['name']}: Not enough stable points")
-                        continue
-                    
-                    # Compute inertia
-                    I = compute_inertia(M_stable, R_stable)
-                    
-                    # Find valid points (non-NaN, non-inf, positive)
-                    valid_mask = (~np.isnan(I)) & (~np.isinf(I)) & (I > 0) & (I < 1e6)  # Reasonable upper limit
-                    
-                    valid_count = np.sum(valid_mask)
-                    print(f"DEBUG inertia {result['name']}: Valid points: {valid_count}/{len(I)}")
-                    
-                    if valid_count < 2:
-                        print(f"DEBUG inertia {result['name']}: Not enough valid inertia points")
-                        continue
-                    
-                    # Use all valid points for plotting
-                    M_valid = M_stable[valid_mask]
-                    I_valid = I[valid_mask]
-                    
-                    print(f"DEBUG inertia {result['name']}: Plotting {len(M_valid)} points")
-                    print(f"DEBUG inertia {result['name']}: M range: {M_valid.min():.3f} to {M_valid.max():.3f}")
-                    print(f"DEBUG inertia {result['name']}: I range: {I_valid.min():.3f} to {I_valid.max():.3f}")
-                    
-                    fig.add_trace(go.Scatter(
-                        x=M_valid,
-                        y=I_valid,
-                        mode='lines+markers',  # Add markers to see if lines are too short
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=3),
-                        marker=dict(size=4)
-                    ))
-                    
-                except Exception as e:
-                    print(f"ERROR in inertia plot for {result.get('name', 'unknown')}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-            
-            # Update layout with better ranges
-            fig.update_layout(
-                title='Moment of Inertia',
-                xaxis_title='Mass (M☉)',
-                yaxis_title='I (10⁴⁵ g·cm²)',
-                xaxis=dict(range=[0.5, 3.0]),  # Wider range
-                yaxis=dict(range=[0, 100]),    # Reasonable inertia range
-                template='plotly_dark'
-            )
-            
-            print(f"DEBUG inertia: Final plot has {len(fig.data)} traces")
-            
-            fig.update_layout(
-                title='Moment of Inertia',
-                xaxis_title='Mass (M☉)',
-                yaxis_title='I (10⁴⁵ g·cm²)',
-                xaxis=dict(range=[1, 2.7]),
-                template='plotly_dark'
-            )
-        
-        else:
-            # Invalid plot type
-            fig.add_annotation(text=f"Invalid plot type: {plot_type}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-        
-        # Ensure we have at least one trace
-        if len(fig.data) == 0:
-            fig.add_annotation(text="No valid data to display", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-        
-        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+    """Create Plotly figure based on plot type"""
+    fig = go.Figure()
     
-    except Exception as e:
-        print(f"Error in create_plot: {e}")
-        # Return a basic error plot
-        fig = go.Figure()
-        fig.add_annotation(text=f"Error creating plot: {str(e)}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+    if plot_type == 'mass-rho':
+        for result in results:
+            fig.add_trace(go.Scatter(
+                x=result['rho'],
+                y=result['M'],
+                mode='lines',
+                name=result['name'],
+                line=dict(color=result.get('color', '#000000'), width=2)
+            ))
+        fig.update_layout(
+            title='Mass vs Central Density',
+            xaxis_title='ρc (g/cm³)',
+            yaxis_title='Mass (M☉)',
+            xaxis_type='log',
+            template='plotly_dark'
+        )
+    
+    elif plot_type == 'radius-rho':
+        for result in results:
+            fig.add_trace(go.Scatter(
+                x=result['rho'],
+                y=result['R'],
+                mode='lines',
+                name=result['name'],
+                line=dict(color=result.get('color', '#000000'), width=2)
+            ))
+        fig.update_layout(
+            title='Radius vs Central Density',
+            xaxis_title='ρc (g/cm³)',
+            yaxis_title='Radius (km)',
+            xaxis_type='log',
+            yaxis=dict(range=[9, 30]),
+            template='plotly_dark'
+        )
+    
+    elif plot_type == 'mass-radius':
+        for result in results:
+            fig.add_trace(go.Scatter(
+                x=result['R'],
+                y=result['M'],
+                mode='lines',
+                name=result['name'],
+                line=dict(color=result.get('color', '#000000'), width=2)
+            ))
+        fig.update_layout(
+            title='Mass vs Radius',
+            xaxis_title='Radius (km)',
+            yaxis_title='Mass (M☉)',
+            xaxis=dict(range=[8, 20]),
+            yaxis=dict(range=[0, 3]),
+            template='plotly_dark'
+        )
+    
+    elif plot_type == 'inertia':
+        for result in results:
+            M = np.array(result['M'])
+            R = np.array(result['R'])
+            max_idx = np.argmax(M)
+            M_stable = M[:max_idx+1]
+            R_stable = R[:max_idx+1]
+            I = compute_inertia(M_stable, R_stable)
+            
+            fig.add_trace(go.Scatter(
+                x=M_stable,
+                y=I,
+                mode='lines',
+                name=result['name'],
+                line=dict(color=result.get('color', '#000000'), width=2)
+            ))
+        fig.update_layout(
+            title='Moment of Inertia',
+            xaxis_title='Mass (M☉)',
+            yaxis_title='I (10⁴⁵ g·cm²)',
+            xaxis=dict(range=[1, 2.7]),
+            template='plotly_dark'
+        )
+    
+    return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
 
 # Routes
 @app.route('/')
