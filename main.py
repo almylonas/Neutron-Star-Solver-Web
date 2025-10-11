@@ -19,6 +19,18 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
+# Check if running in Railway
+IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
+
+# Environment-specific configuration
+if IS_RAILWAY:
+    print("🚄 Running in Railway environment - optimizing for containerized deployment")
+    # Use sequential processing instead of parallel for Railway
+    PARALLEL_ENABLED = False
+else:
+    PARALLEL_ENABLED = True
+    print("💻 Running in local environment - parallel processing enabled")
+
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -189,19 +201,35 @@ def ns_solve_numba(rho_0, rho_arr, P_arr, dr=500.0, max_iter=80000, tol=1e-10):
     
     return r, m, P
 
-@jit(nopython=True, parallel=True, fastmath=True)
-def solve_all_densities(rho_array, rho_eos, P_eos):
-    """Solve for all densities in parallel"""
-    n = len(rho_array)
-    results = np.zeros((3, n))
-    
-    for i in prange(n):
-        r, m, P = ns_solve_numba(rho_array[i], rho_eos, P_eos)
-        results[0, i] = r
-        results[1, i] = m
-        results[2, i] = P
-    
-    return results
+# Modified for Railway compatibility
+if PARALLEL_ENABLED:
+    @jit(nopython=True, parallel=True, fastmath=True)
+    def solve_all_densities(rho_array, rho_eos, P_eos):
+        """Solve for all densities in parallel (local environment)"""
+        n = len(rho_array)
+        results = np.zeros((3, n))
+        
+        for i in prange(n):
+            r, m, P = ns_solve_numba(rho_array[i], rho_eos, P_eos)
+            results[0, i] = r
+            results[1, i] = m
+            results[2, i] = P
+        
+        return results
+else:
+    @jit(nopython=True, fastmath=True)
+    def solve_all_densities(rho_array, rho_eos, P_eos):
+        """Solve for all densities sequentially (Railway environment)"""
+        n = len(rho_array)
+        results = np.zeros((3, n))
+        
+        for i in range(n):  # Use regular range instead of prange
+            r, m, P = ns_solve_numba(rho_array[i], rho_eos, P_eos)
+            results[0, i] = r
+            results[1, i] = m
+            results[2, i] = P
+        
+        return results
 
 def compute_eos(eos_name, rho_arr, P_arr):
     """Compute neutron star properties for given EOS"""
@@ -227,8 +255,41 @@ def compute_eos(eos_name, rho_arr, P_arr):
     }
 
 def compute_inertia(m, r):
-    """Compute moment of inertia"""
-    return (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*(m/r) + 90*(m/r)**4) / 1e45
+    """Compute moment of inertia with enhanced error handling"""
+    try:
+        # Ensure arrays are valid numpy arrays
+        m = np.asarray(m, dtype=np.float64)
+        r = np.asarray(r, dtype=np.float64)
+        
+        # Check for empty arrays
+        if len(m) == 0 or len(r) == 0:
+            print("WARNING: Empty arrays passed to compute_inertia")
+            return np.array([])
+        
+        # Check array lengths match
+        if len(m) != len(r):
+            print(f"WARNING: Array length mismatch - M: {len(m)}, R: {len(r)}")
+            min_len = min(len(m), len(r))
+            m = m[:min_len]
+            r = r[:min_len]
+        
+        # Avoid division by zero and extreme values
+        m_r_ratio = np.divide(m, r, out=np.zeros_like(m), where=r != 0)
+        m_r_ratio = np.clip(m_r_ratio, 1e-10, 0.3)  # Physical bounds
+        
+        # Compute inertia with safe operations
+        inertia = (0.237 + 0.008) * m * r**2 * 1.989e43 
+        inertia *= (1 + 4.2 * m_r_ratio + 90 * m_r_ratio**4) 
+        inertia /= 1e45
+        
+        # Replace any invalid values
+        inertia = np.nan_to_num(inertia, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return inertia
+        
+    except Exception as e:
+        print(f"ERROR in compute_inertia: {str(e)}")
+        return np.array([])
 
 def create_plot(results, plot_type):
     """Create Plotly figure based on plot type"""
@@ -288,21 +349,49 @@ def create_plot(results, plot_type):
         )
     
     elif plot_type == 'inertia':
+        print(f"DEBUG: Creating inertia plot with {len(results)} EOS results")
+        valid_traces = 0
+        
         for result in results:
-            M = np.array(result['M'])
-            R = np.array(result['R'])
-            max_idx = np.argmax(M)
-            M_stable = M[:max_idx+1]
-            R_stable = R[:max_idx+1]
-            I = compute_inertia(M_stable, R_stable)
-            
+            try:
+                M = np.array(result['M'])
+                R = np.array(result['R'])
+                
+                # Find stable branch (up to maximum mass)
+                max_idx = np.argmax(M)
+                M_stable = M[:max_idx+1]
+                R_stable = R[:max_idx+1]
+                
+                print(f"  Processing {result['name']}: {len(M_stable)} stable points")
+                
+                # Compute inertia
+                I = compute_inertia(M_stable, R_stable)
+                
+                if len(I) > 0 and not np.all(I == 0):
+                    fig.add_trace(go.Scatter(
+                        x=M_stable,
+                        y=I,
+                        mode='lines',
+                        name=result['name'],
+                        line=dict(color=result.get('color', '#000000'), width=2)
+                    ))
+                    valid_traces += 1
+                    print(f"    ✓ Added inertia trace with {len(I)} points")
+                else:
+                    print(f"    ✗ Skipping {result['name']} - invalid inertia values")
+                    
+            except Exception as e:
+                print(f"    ✗ Error processing {result['name']}: {str(e)}")
+                continue
+        
+        if valid_traces == 0:
+            print("WARNING: No valid inertia traces to plot")
+            # Add an empty trace to avoid Plotly errors
             fig.add_trace(go.Scatter(
-                x=M_stable,
-                y=I,
-                mode='lines',
-                name=result['name'],
-                line=dict(color=result.get('color', '#000000'), width=2)
+                x=[], y=[], mode='lines',
+                name='No valid data'
             ))
+        
         fig.update_layout(
             title='Moment of Inertia',
             xaxis_title='Mass (M☉)',
@@ -323,6 +412,8 @@ def index():
                 if name in eos_cache]
     
     print(f"\nServing index page with {len(eos_list)} available EOS")
+    print(f"Environment: {'Railway' if IS_RAILWAY else 'Local'}")
+    print(f"Parallel processing: {'Enabled' if PARALLEL_ENABLED else 'Disabled'}")
     return render_template('index.html', eos_list=eos_list)
 
 @app.route('/compute', methods=['POST'])
@@ -336,6 +427,7 @@ def compute():
         print(f"\nCompute request received:")
         print(f"  Selected EOS: {selected_eos}")
         print(f"  Plot type: {plot_type}")
+        print(f"  Environment: {'Railway' if IS_RAILWAY else 'Local'}")
         
         if not selected_eos:
             return jsonify({'error': 'No EOS selected'}), 400
@@ -361,17 +453,18 @@ def compute():
         if not results:
             return jsonify({'error': 'No valid EOS could be computed'}), 400
         
-        # Debug inertia specifically
+        # Enhanced debugging for inertia plot
         if plot_type == 'inertia':
-            print(f"DEBUG: Creating inertia plot with {len(results)} results")
+            print(f"\nDEBUG: Inertia plot requested")
+            print(f"  Number of EOS results: {len(results)}")
             for i, result in enumerate(results):
                 M = np.array(result['M'])
                 R = np.array(result['R'])
                 max_idx = np.argmax(M)
-                print(f"  Result {i}: {result['name']}")
+                print(f"  EOS {i+1}: {result['name']}")
                 print(f"    Total points: {len(M)}, Stable branch: {max_idx+1}")
-                print(f"    M range: {M.min():.3f} to {M.max():.3f}")
-                print(f"    R range: {R.min():.3f} to {R.max():.3f}")
+                print(f"    M range: {M.min():.3f} to {M.max():.3f} M☉")
+                print(f"    R range: {R.min():.3f} to {R.max():.3f} km")
         
         # Create plot
         plot_json = create_plot(results, plot_type)
@@ -383,7 +476,8 @@ def compute():
             'radius': f"{r['max_radius']:.2f}"
         } for r in results]
         
-        print(f"  ✓ Computation complete - Plot type: {plot_type}\n")
+        print(f"  ✓ Computation complete - Plot type: {plot_type}")
+        print(f"  ✓ Results: {len(results)} EOS processed\n")
         
         return jsonify({
             'plot': plot_json,
@@ -501,6 +595,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <p class="text-lg text-gray-400 max-w-2xl mx-auto">
                 TOV Equation Solver for Various Equations of State - Explore the properties of neutron stars
             </p>
+            <div class="mt-2 inline-flex items-center gap-2 px-3 py-1 bg-slate-800/50 rounded-full text-sm text-cyan-300">
+                <span id="env-badge"></span>
+            </div>
         </div>
         
         <!-- Main Grid -->
@@ -601,7 +698,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <script>
         let currentStats = [];
         
+        // Detect environment
+        const isRailway = window.location.hostname.includes('railway') || 
+                         window.location.hostname.includes('up');
+        document.getElementById('env-badge').textContent = 
+            isRailway ? '🚄 Railway Environment' : '💻 Local Environment';
+        
         console.log('Neutron Star Solver initialized');
+        console.log('Environment:', isRailway ? 'Railway' : 'Local');
         
         document.getElementById('compute-btn').addEventListener('click', function() {
             console.log('Compute button clicked');
@@ -736,6 +840,7 @@ print("Loading EOS data and compiling JIT functions...")
 load_eos_data()
 
 # Precompile Numba functions
+print("Precompiling Numba functions...")
 dummy_rho = np.array([1e14, 2e14, 3e14], dtype=np.float64)
 dummy_P = np.array([1e33, 2e33, 3e33], dtype=np.float64)
 _ = ns_solve_numba(1.5e14, dummy_rho, dummy_P)
@@ -745,6 +850,8 @@ print("✓ Ready!")
 print("\n" + "="*50)
 print("Starting Flask server...")
 print("Access the app at: http://localhost:5000")
+print("Environment:", "Railway" if IS_RAILWAY else "Local")
+print("Parallel processing:", "Enabled" if PARALLEL_ENABLED else "Disabled")
 print("="*50 + "\n")
 
 if __name__ == '__main__':
