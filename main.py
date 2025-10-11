@@ -323,31 +323,75 @@ def create_plot(results, plot_type):
             )
         
         elif plot_type == 'inertia':
+            print(f"DEBUG: Creating inertia plot with {len(results)} results")
+            
             for result in results:
                 try:
-                    if 'M' in result and 'R' in result and len(result['M']) > 0 and len(result['R']) > 0:
-                        M = np.array(result['M'])
-                        R = np.array(result['R'])
-                        max_idx = np.argmax(M)
-                        M_stable = M[:max_idx+1]
-                        R_stable = R[:max_idx+1]
-                        
-                        if len(M_stable) > 0 and len(R_stable) > 0:
-                            I = compute_inertia(M_stable, R_stable)
-                            
-                            # Filter out invalid values
-                            valid_mask = ~np.isnan(I) & ~np.isinf(I) & (I > 0)
-                            if np.any(valid_mask):
-                                fig.add_trace(go.Scatter(
-                                    x=M_stable[valid_mask],
-                                    y=I[valid_mask],
-                                    mode='lines',
-                                    name=result['name'],
-                                    line=dict(color=result.get('color', '#000000'), width=2)
-                                ))
+                    print(f"DEBUG inertia: Processing {result['name']}")
+                    
+                    M = np.array(result['M'])
+                    R = np.array(result['R'])
+                    
+                    print(f"DEBUG inertia {result['name']}: Total points: {len(M)}")
+                    
+                    # Find stable branch (up to maximum mass)
+                    max_idx = np.argmax(M)
+                    M_stable = M[:max_idx+1]
+                    R_stable = R[:max_idx+1]
+                    
+                    print(f"DEBUG inertia {result['name']}: Stable branch points: {len(M_stable)}")
+                    
+                    if len(M_stable) < 2:
+                        print(f"DEBUG inertia {result['name']}: Not enough stable points")
+                        continue
+                    
+                    # Compute inertia
+                    I = compute_inertia(M_stable, R_stable)
+                    
+                    # Find valid points (non-NaN, non-inf, positive)
+                    valid_mask = (~np.isnan(I)) & (~np.isinf(I)) & (I > 0) & (I < 1e6)  # Reasonable upper limit
+                    
+                    valid_count = np.sum(valid_mask)
+                    print(f"DEBUG inertia {result['name']}: Valid points: {valid_count}/{len(I)}")
+                    
+                    if valid_count < 2:
+                        print(f"DEBUG inertia {result['name']}: Not enough valid inertia points")
+                        continue
+                    
+                    # Use all valid points for plotting
+                    M_valid = M_stable[valid_mask]
+                    I_valid = I[valid_mask]
+                    
+                    print(f"DEBUG inertia {result['name']}: Plotting {len(M_valid)} points")
+                    print(f"DEBUG inertia {result['name']}: M range: {M_valid.min():.3f} to {M_valid.max():.3f}")
+                    print(f"DEBUG inertia {result['name']}: I range: {I_valid.min():.3f} to {I_valid.max():.3f}")
+                    
+                    fig.add_trace(go.Scatter(
+                        x=M_valid,
+                        y=I_valid,
+                        mode='lines+markers',  # Add markers to see if lines are too short
+                        name=result['name'],
+                        line=dict(color=result.get('color', '#000000'), width=3),
+                        marker=dict(size=4)
+                    ))
+                    
                 except Exception as e:
-                    print(f"Error in inertia plot for {result.get('name', 'unknown')}: {e}")
+                    print(f"ERROR in inertia plot for {result.get('name', 'unknown')}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
+            
+            # Update layout with better ranges
+            fig.update_layout(
+                title='Moment of Inertia',
+                xaxis_title='Mass (M☉)',
+                yaxis_title='I (10⁴⁵ g·cm²)',
+                xaxis=dict(range=[0.5, 3.0]),  # Wider range
+                yaxis=dict(range=[0, 100]),    # Reasonable inertia range
+                template='plotly_dark'
+            )
+            
+            print(f"DEBUG inertia: Final plot has {len(fig.data)} traces")
             
             fig.update_layout(
                 title='Moment of Inertia',
