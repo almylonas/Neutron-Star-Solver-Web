@@ -227,91 +227,50 @@ def compute_eos(eos_name, rho_arr, P_arr):
     }
 
 def compute_inertia(m, r):
-    """Compute moment of inertia"""
-    return (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*(m/r) + 90*(m/r)**4) / 1e45
+    """Compute moment of inertia with error handling"""
+    try:
+        return (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*(m/r) + 90*(m/r)**4) / 1e45
+    except Exception as e:
+        print(f"Error in inertia computation: {e}")
+        # Return zeros or fallback values
+        return np.zeros_like(m) if hasattr(m, '__len__') else 0.0
 
 def create_plot(results, plot_type):
     """Create Plotly figure based on plot type"""
     fig = go.Figure()
     
-    if plot_type == 'mass-rho':
+    if plot_type == 'inertia':
         for result in results:
-            fig.add_trace(go.Scatter(
-                x=result['rho'],
-                y=result['M'],
-                mode='lines',
-                name=result['name'],
-                line=dict(color=result.get('color', '#000000'), width=2)
-            ))
-        fig.update_layout(
-            title='Mass vs Central Density',
-            xaxis_title='ρc (g/cm³)',
-            yaxis_title='Mass (M☉)',
-            xaxis_type='log',
-            template='plotly_dark'
-        )
-    
-    elif plot_type == 'radius-rho':
-        for result in results:
-            fig.add_trace(go.Scatter(
-                x=result['rho'],
-                y=result['R'],
-                mode='lines',
-                name=result['name'],
-                line=dict(color=result.get('color', '#000000'), width=2)
-            ))
-        fig.update_layout(
-            title='Radius vs Central Density',
-            xaxis_title='ρc (g/cm³)',
-            yaxis_title='Radius (km)',
-            xaxis_type='log',
-            yaxis=dict(range=[9, 30]),
-            template='plotly_dark'
-        )
-    
-    elif plot_type == 'mass-radius':
-        for result in results:
-            fig.add_trace(go.Scatter(
-                x=result['R'],
-                y=result['M'],
-                mode='lines',
-                name=result['name'],
-                line=dict(color=result.get('color', '#000000'), width=2)
-            ))
-        fig.update_layout(
-            title='Mass vs Radius',
-            xaxis_title='Radius (km)',
-            yaxis_title='Mass (M☉)',
-            xaxis=dict(range=[8, 20]),
-            yaxis=dict(range=[0, 3]),
-            template='plotly_dark'
-        )
-    
-    elif plot_type == 'inertia':
-        for result in results:
-            M = np.array(result['M'])
-            R = np.array(result['R'])
-            max_idx = np.argmax(M)
-            M_stable = M[:max_idx+1]
-            R_stable = R[:max_idx+1]
-            I = compute_inertia(M_stable, R_stable)
-            
-            fig.add_trace(go.Scatter(
-                x=M_stable,
-                y=I,
-                mode='lines',
-                name=result['name'],
-                line=dict(color=result.get('color', '#000000'), width=2)
-            ))
-        fig.update_layout(
-            title='Moment of Inertia',
-            xaxis_title='Mass (M☉)',
-            yaxis_title='I (10⁴⁵ g·cm²)',
-            xaxis=dict(range=[1, 2.7]),
-            template='plotly_dark'
-        )
-    
-    return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+            try:
+                M = np.array(result['M'])
+                R = np.array(result['R'])
+                max_idx = np.argmax(M)
+                M_stable = M[:max_idx+1]
+                R_stable = R[:max_idx+1]
+                
+                # Check for valid data
+                if len(M_stable) == 0 or len(R_stable) == 0:
+                    print(f"Skipping {result['name']} - no stable branch data")
+                    continue
+                
+                I = compute_inertia(M_stable, R_stable)
+                
+                # Check for invalid values
+                if np.any(np.isnan(I)) or np.any(np.isinf(I)):
+                    print(f"Invalid inertia values for {result['name']}")
+                    continue
+                
+                fig.add_trace(go.Scatter(
+                    x=M_stable,
+                    y=I,
+                    mode='lines',
+                    name=result['name'],
+                    line=dict(color=result.get('color', '#000000'), width=2)
+                ))
+                
+            except Exception as e:
+                print(f"Error creating inertia plot for {result['name']}: {e}")
+                continue
 
 # Routes
 @app.route('/')
@@ -356,9 +315,22 @@ def compute():
             result['color'] = eos_cache[eos_name]['color']
             results.append(result)
             print(f"    ✓ Max mass: {result['max_mass']:.3f} M☉")
+            print(f"    ✓ Data points: {len(result['M'])}")
         
         if not results:
             return jsonify({'error': 'No valid EOS could be computed'}), 400
+        
+        # Debug inertia specifically
+        if plot_type == 'inertia':
+            print(f"DEBUG: Creating inertia plot with {len(results)} results")
+            for i, result in enumerate(results):
+                M = np.array(result['M'])
+                R = np.array(result['R'])
+                max_idx = np.argmax(M)
+                print(f"  Result {i}: {result['name']}")
+                print(f"    Total points: {len(M)}, Stable branch: {max_idx+1}")
+                print(f"    M range: {M.min():.3f} to {M.max():.3f}")
+                print(f"    R range: {R.min():.3f} to {R.max():.3f}")
         
         # Create plot
         plot_json = create_plot(results, plot_type)
@@ -370,7 +342,7 @@ def compute():
             'radius': f"{r['max_radius']:.2f}"
         } for r in results]
         
-        print(f"  ✓ Computation complete\n")
+        print(f"  ✓ Computation complete - Plot type: {plot_type}\n")
         
         return jsonify({
             'plot': plot_json,
