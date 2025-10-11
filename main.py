@@ -236,41 +236,122 @@ def compute_inertia(m, r):
         return np.zeros_like(m) if hasattr(m, '__len__') else 0.0
 
 def create_plot(results, plot_type):
-    """Create Plotly figure based on plot type"""
-    fig = go.Figure()
+    """Create Plotly figure based on plot type with proper error handling"""
+    try:
+        fig = go.Figure()
+        
+        if not results:
+            # Return empty plot if no results
+            fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+        
+        if plot_type == 'mass-rho':
+            for result in results:
+                if 'rho' in result and 'M' in result and len(result['rho']) > 0 and len(result['M']) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=result['rho'],
+                        y=result['M'],
+                        mode='lines',
+                        name=result['name'],
+                        line=dict(color=result.get('color', '#000000'), width=2)
+                    ))
+            fig.update_layout(
+                title='Mass vs Central Density',
+                xaxis_title='ρc (g/cm³)',
+                yaxis_title='Mass (M☉)',
+                xaxis_type='log',
+                template='plotly_dark'
+            )
+        
+        elif plot_type == 'radius-rho':
+            for result in results:
+                if 'rho' in result and 'R' in result and len(result['rho']) > 0 and len(result['R']) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=result['rho'],
+                        y=result['R'],
+                        mode='lines',
+                        name=result['name'],
+                        line=dict(color=result.get('color', '#000000'), width=2)
+                    ))
+            fig.update_layout(
+                title='Radius vs Central Density',
+                xaxis_title='ρc (g/cm³)',
+                yaxis_title='Radius (km)',
+                xaxis_type='log',
+                yaxis=dict(range=[9, 30]),
+                template='plotly_dark'
+            )
+        
+        elif plot_type == 'mass-radius':
+            for result in results:
+                if 'R' in result and 'M' in result and len(result['R']) > 0 and len(result['M']) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=result['R'],
+                        y=result['M'],
+                        mode='lines',
+                        name=result['name'],
+                        line=dict(color=result.get('color', '#000000'), width=2)
+                    ))
+            fig.update_layout(
+                title='Mass vs Radius',
+                xaxis_title='Radius (km)',
+                yaxis_title='Mass (M☉)',
+                xaxis=dict(range=[8, 20]),
+                yaxis=dict(range=[0, 3]),
+                template='plotly_dark'
+            )
+        
+        elif plot_type == 'inertia':
+            for result in results:
+                try:
+                    if 'M' in result and 'R' in result and len(result['M']) > 0 and len(result['R']) > 0:
+                        M = np.array(result['M'])
+                        R = np.array(result['R'])
+                        max_idx = np.argmax(M)
+                        M_stable = M[:max_idx+1]
+                        R_stable = R[:max_idx+1]
+                        
+                        if len(M_stable) > 0 and len(R_stable) > 0:
+                            I = compute_inertia(M_stable, R_stable)
+                            
+                            # Filter out invalid values
+                            valid_mask = ~np.isnan(I) & ~np.isinf(I) & (I > 0)
+                            if np.any(valid_mask):
+                                fig.add_trace(go.Scatter(
+                                    x=M_stable[valid_mask],
+                                    y=I[valid_mask],
+                                    mode='lines',
+                                    name=result['name'],
+                                    line=dict(color=result.get('color', '#000000'), width=2)
+                                ))
+                except Exception as e:
+                    print(f"Error in inertia plot for {result.get('name', 'unknown')}: {e}")
+                    continue
+            
+            fig.update_layout(
+                title='Moment of Inertia',
+                xaxis_title='Mass (M☉)',
+                yaxis_title='I (10⁴⁵ g·cm²)',
+                xaxis=dict(range=[1, 2.7]),
+                template='plotly_dark'
+            )
+        
+        else:
+            # Invalid plot type
+            fig.add_annotation(text=f"Invalid plot type: {plot_type}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        
+        # Ensure we have at least one trace
+        if len(fig.data) == 0:
+            fig.add_annotation(text="No valid data to display", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        
+        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
     
-    if plot_type == 'inertia':
-        for result in results:
-            try:
-                M = np.array(result['M'])
-                R = np.array(result['R'])
-                max_idx = np.argmax(M)
-                M_stable = M[:max_idx+1]
-                R_stable = R[:max_idx+1]
-                
-                # Check for valid data
-                if len(M_stable) == 0 or len(R_stable) == 0:
-                    print(f"Skipping {result['name']} - no stable branch data")
-                    continue
-                
-                I = compute_inertia(M_stable, R_stable)
-                
-                # Check for invalid values
-                if np.any(np.isnan(I)) or np.any(np.isinf(I)):
-                    print(f"Invalid inertia values for {result['name']}")
-                    continue
-                
-                fig.add_trace(go.Scatter(
-                    x=M_stable,
-                    y=I,
-                    mode='lines',
-                    name=result['name'],
-                    line=dict(color=result.get('color', '#000000'), width=2)
-                ))
-                
-            except Exception as e:
-                print(f"Error creating inertia plot for {result['name']}: {e}")
-                continue
+    except Exception as e:
+        print(f"Error in create_plot: {e}")
+        # Return a basic error plot
+        fig = go.Figure()
+        fig.add_annotation(text=f"Error creating plot: {str(e)}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
 
 # Routes
 @app.route('/')
