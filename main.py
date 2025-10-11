@@ -227,13 +227,34 @@ def compute_eos(eos_name, rho_arr, P_arr):
     }
 
 def compute_inertia(m, r):
-    """Compute moment of inertia with error handling"""
+    """Compute moment of inertia with detailed debugging"""
     try:
-        return (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*(m/r) + 90*(m/r)**4) / 1e45
+        print(f"DEBUG inertia: m shape: {m.shape}, r shape: {r.shape}")
+        print(f"DEBUG inertia: m range: {m.min():.3f} to {m.max():.3f}")
+        print(f"DEBUG inertia: r range: {r.min():.3f} to {r.max():.3f}")
+        
+        # Check for division by zero issues
+        if np.any(r == 0):
+            print("WARNING: Zero radius detected in inertia calculation")
+            r = np.where(r == 0, 1e-10, r)  # Replace zeros with small value
+        
+        # Check m/r ratio to avoid large values
+        m_r_ratio = m / r
+        print(f"DEBUG inertia: m/r ratio range: {m_r_ratio.min():.3f} to {m_r_ratio.max():.3f}")
+        
+        # The inertia formula
+        inertia = (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*m_r_ratio + 90*m_r_ratio**4) / 1e45
+        
+        print(f"DEBUG inertia: result range: {inertia.min():.3f} to {inertia.max():.3f}")
+        print(f"DEBUG inertia: NaN count: {np.sum(np.isnan(inertia))}, Inf count: {np.sum(np.isinf(inertia))}")
+        
+        return inertia
+        
     except Exception as e:
-        print(f"Error in inertia computation: {e}")
-        # Return zeros or fallback values
-        return np.zeros_like(m) if hasattr(m, '__len__') else 0.0
+        print(f"ERROR in compute_inertia: {e}")
+        import traceback
+        traceback.print_exc()
+        return np.zeros_like(m)
 
 def create_plot(results, plot_type):
     """Create Plotly figure based on plot type with proper error handling"""
