@@ -1,38 +1,3 @@
-<script>
-        let currentStats = [];
-        
-        console.log('Neutron Star Solver initialized');
-        
-        // Show/hide profile options based on plot selection
-        document.querySelectorAll('input[name="plot"]').forEach(radio => {
-            radio.addEventListener('change', function() {
-                const profileOptions = document.getElementById('profile-options');
-                if (this.value === 'density-profile') {
-                    profileOptions.classList.remove('hidden');
-                } else {
-                    profileOptions.classList.add('hidden');
-                }
-            });
-        });
-        
-        document.getElementById('compute-btn').addEventListener('click', function() {
-            console.log('Compute button clicked');
-            
-            const plotType = document.querySelector('input[name="plot"]:checked').value;
-            
-            if (plotType === 'density-profile') {
-                computeDensityProfile();
-            } else {
-                computeMRCurves();
-            }
-        });
-        
-        function computeMRCurves() {"""
-Neutron Star Solver Flask Web Application
-Run with: python app.py
-Access at: http://localhost:5000
-"""
-
 from flask import Flask, render_template, request, jsonify, send_file
 import numpy as np
 import pandas as pd
