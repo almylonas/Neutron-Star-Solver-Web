@@ -31,12 +31,12 @@ FOUR_PI = 4.0 * np.pi
 
 # EOS Configuration
 EOS_CONFIG = [
-    ("BSK20", "bsk20.csv", 6, "#000000"),
-    ("DD2", "dd2.csv", 4, "#228B22"),
+    ("BSK20", "bsk20.csv", 6, "#D7009A"),
+    ("DD2", "dd2.csv", 4, "#16A1BD"),
     ("APR3", "apr3.csv", 1, "#800080"),
     ("ENG", "eng.csv", 1, "#000080"),
     ("TMA", "tma.csv", 3, "#B22222"),
-    ("WFF2", "wff2.csv", 1, "#00FFFF"),
+    ("WFF2", "wff2.csv", 1, "#BE00BB"),
     ("H4", "h4.csv", 1, "#FF69B4"),
     ("MPA1", "mpa1.csv", 4, "#CD853F"),
     ("SFHOY", "sfhoy.csv", 4, "#708090"),
@@ -46,7 +46,7 @@ EOS_CONFIG = [
     ("APRLD", "aprld.csv", 4, "#D8BFD8"),
     ("BHBLP", "bhblp.csv", 4, "#4682B4"),
     ("DD2F", "dd2f.csv", 1, "#EE82EE"),
-    ("SLY", "sly.csv", 1, "#CD5C5C"),
+    ("SLY", "sly.csv", 1, "#6FAC52"),
     ("FPS", "fps.csv", 1, "#808000"),
     ("ALF2", "alf2.csv", 1, "#7FFF00")
 ]
