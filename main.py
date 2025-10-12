@@ -350,6 +350,15 @@ def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80
     # Get central pressure from EOS
     P_c = interp_P(rho_c, rho_arr, P_arr)
     
+    # Check if central density is within EOS range
+    if rho_c < rho_arr[0] or rho_c > rho_arr[-1]:
+        # Return invalid result
+        r_arr_out = np.zeros(1)
+        m_arr_out = np.array([np.inf])
+        P_arr_out = np.zeros(1)
+        rho_arr_out = np.zeros(1)
+        return (r_arr_out, m_arr_out, P_arr_out, rho_arr_out, r0, np.inf)
+    
     # Initial conditions at r0
     r = r0
     # CORRECTED: m(r0) = (4/3)π r0³ ρc (NOT ρc c²)
@@ -372,28 +381,55 @@ def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80
     
     # RK4 integration
     for i in range(1, max_iter):
+        # Check if pressure is still in valid range
+        if P < P_arr[0] or P > P_arr[-1]:
+            break
+            
         rho = interp_rho(P, rho_arr, P_arr)
         
+        # Safety check
+        if not np.isfinite(rho) or not np.isfinite(m) or not np.isfinite(P):
+            break
+        
         # RK4 step
-        k1_m, k1_P = tov_derivatives_profile_v2(r, m, P, rho)
+        k1_m, k1_P = tov_derivatives_profile(r, m, P, rho)
         
         r2 = r + 0.5 * dr
         m2 = m + 0.5 * dr * k1_m
         P2 = P + 0.5 * dr * k1_P
+        
+        # Check if P2 is valid
+        if P2 < P_arr[0]:
+            P2 = P_arr[0]
+        if P2 > P_arr[-1]:
+            P2 = P_arr[-1]
+            
         rho2 = interp_rho(P2, rho_arr, P_arr)
-        k2_m, k2_P = tov_derivatives_profile_v2(r2, m2, P2, rho2)
+        k2_m, k2_P = tov_derivatives_profile(r2, m2, P2, rho2)
         
         r3 = r + 0.5 * dr
         m3 = m + 0.5 * dr * k2_m
         P3 = P + 0.5 * dr * k2_P
+        
+        if P3 < P_arr[0]:
+            P3 = P_arr[0]
+        if P3 > P_arr[-1]:
+            P3 = P_arr[-1]
+            
         rho3 = interp_rho(P3, rho_arr, P_arr)
-        k3_m, k3_P = tov_derivatives_profile_v2(r3, m3, P3, rho3)
+        k3_m, k3_P = tov_derivatives_profile(r3, m3, P3, rho3)
         
         r4 = r + dr
         m4 = m + dr * k3_m
         P4 = P + dr * k3_P
+        
+        if P4 < P_arr[0]:
+            P4 = P_arr[0]
+        if P4 > P_arr[-1]:
+            P4 = P_arr[-1]
+            
         rho4 = interp_rho(P4, rho_arr, P_arr)
-        k4_m, k4_P = tov_derivatives_profile_v2(r4, m4, P4, rho4)
+        k4_m, k4_P = tov_derivatives_profile(r4, m4, P4, rho4)
         
         # Update
         r += dr
@@ -404,8 +440,16 @@ def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80
         if P <= P_SURF or P < 0:
             break
         
+        # Safety check on mass growth
+        if m < 0 or not np.isfinite(m):
+            break
+        
         # Store values
-        rho_arr_out[idx] = interp_rho(P, rho_arr, P_arr)
+        if P >= P_arr[0] and P <= P_arr[-1]:
+            rho_arr_out[idx] = interp_rho(P, rho_arr, P_arr)
+        else:
+            rho_arr_out[idx] = 0.0
+            
         r_arr_out[idx] = r
         m_arr_out[idx] = m
         P_arr_out[idx] = P
@@ -415,7 +459,7 @@ def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80
     return (r_arr_out[:idx], m_arr_out[:idx], P_arr_out[:idx], 
             rho_arr_out[:idx], r, m)
 
-def find_rho_c_for_mass_v2(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
+def find_rho_c_for_mass(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
     """
     Find central density for target mass - CORRECTED VERSION
     """
@@ -460,7 +504,7 @@ def find_rho_c_for_mass_v2(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
     
     def mass_difference(rho_c):
         try:
-            _, _, _, _, _, M = integrate_tov_profile_v2(rho_c, rho_arr, P_arr)
+            _, _, _, _, _, M = integrate_tov_profile(rho_c, rho_arr, P_arr)
             diff = M - target_mass_g
             return diff
         except Exception as e:
@@ -506,17 +550,41 @@ def compute_density_profile(eos_name, target_mass_solar):
     rho_eos = eos_cache[eos_name]['rho']
     P_eos = eos_cache[eos_name]['P']
     
+    # Debug: Print EOS range
+    print(f"\nEOS {eos_name} range:")
+    print(f"  ρ: [{rho_eos[0]:.3e}, {rho_eos[-1]:.3e}] g/cm³")
+    print(f"  P: [{P_eos[0]:.3e}, {P_eos[-1]:.3e}] dyn/cm²")
+    
     print(f"Building M(ρc) grid for {eos_name}...")
     rho_grid = np.concatenate([
         np.arange(2.5e14, 1e15, 0.5e13),
         np.arange(1e15, 4e15, 0.5e14)
     ])
     
+    # Filter rho_grid to be within EOS range
+    rho_grid = rho_grid[(rho_grid >= rho_eos[0]) & (rho_grid <= rho_eos[-1])]
+    print(f"  Using {len(rho_grid)} density points in range")
+    
+    if len(rho_grid) < 2:
+        raise ValueError(f"Not enough valid density points for EOS {eos_name}")
+    
     results = solve_all_densities(rho_grid, rho_eos, P_eos)
     M_grid = results[1, :] / 2e33
     
+    # Debug: Check for inf/nan in M_grid
+    valid_mask = np.isfinite(M_grid) & (M_grid > 0)
+    if not np.any(valid_mask):
+        raise ValueError(f"No valid masses computed for EOS {eos_name}. Check EOS data.")
+    
+    print(f"  Valid mass results: {np.sum(valid_mask)}/{len(M_grid)}")
+    print(f"  M range: [{M_grid[valid_mask].min():.3f}, {M_grid[valid_mask].max():.3f}] M☉")
+    
+    # Use only valid points
+    rho_grid = rho_grid[valid_mask]
+    M_grid = M_grid[valid_mask]
+    
     print(f"Finding ρc for M = {target_mass_solar:.3f} M☉...")
-    rho_c = find_rho_c_for_mass_v2(
+    rho_c = find_rho_c_for_mass(
         target_mass_solar, 
         rho_eos, 
         P_eos,
@@ -526,9 +594,13 @@ def compute_density_profile(eos_name, target_mass_solar):
     print(f"Found ρc = {rho_c:.3e} g/cm³")
     
     print("Integrating TOV equations...")
-    r_arr, m_arr, P_arr, rho_arr, R_final, M_final = integrate_tov_profile_v2(
+    r_arr, m_arr, P_arr, rho_arr, R_final, M_final = integrate_tov_profile(
         rho_c, rho_eos, P_eos
     )
+    
+    # Check for inf/nan
+    if not np.isfinite(M_final) or M_final <= 0:
+        raise ValueError(f"Integration failed: M_final = {M_final}")
     
     r_km = r_arr / 1e5
     M_solar = m_arr / 2e33
