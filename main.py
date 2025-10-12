@@ -413,43 +413,96 @@ def find_rho_c_for_mass(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
         
         # Find where M reaches maximum
         max_idx = np.argmax(M_grid)
+        M_max = M_grid[max_idx]
+        
+        print(f"  M_max for this EOS: {M_max:.3f} M☉")
+        print(f"  Target mass: {target_mass_solar:.3f} M☉")
         
         # Check if target mass is achievable
-        if target_mass_solar > M_grid[max_idx]:
+        if target_mass_solar > M_max:
             raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ exceeds maximum "
-                           f"{M_grid[max_idx]:.3f} M☉ for this EOS")
+                           f"{M_max:.3f} M☉ for this EOS")
         
-        # Find bracketing densities on stable branch
+        # Check minimum mass
+        M_min = M_grid[0]
+        if target_mass_solar < M_min:
+            raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ is below minimum "
+                           f"{M_min:.3f} M☉ for this EOS")
+        
+        # Find bracketing densities on stable branch (up to maximum)
         stable_rho = rho_grid[:max_idx+1]
         stable_M = M_grid[:max_idx+1]
         
         # Find indices that bracket the target
+        # Since M increases with rho_c on stable branch, we can search directly
         idx = np.searchsorted(stable_M, target_mass_solar)
-        if idx == 0 or idx >= len(stable_M):
-            raise ValueError(f"Cannot bracket target mass {target_mass_solar:.3f} M☉")
         
-        rho_low = stable_rho[idx-1]
-        rho_high = stable_rho[idx]
+        if idx == 0:
+            # Target is at or below minimum - use first two points
+            rho_low = stable_rho[0]
+            rho_high = stable_rho[1]
+        elif idx >= len(stable_M):
+            # Target is at maximum - use last two points
+            rho_low = stable_rho[-2]
+            rho_high = stable_rho[-1]
+        else:
+            # Normal case - bracket found
+            rho_low = stable_rho[idx-1]
+            rho_high = stable_rho[idx]
+        
+        print(f"  Bracketing: rho_c ∈ [{rho_low:.3e}, {rho_high:.3e}] g/cm³")
+        print(f"  Corresponding masses: [{stable_M[max(0,idx-1)]:.3f}, {stable_M[min(idx, len(stable_M)-1)]:.3f}] M☉")
     else:
         # Use reasonable defaults based on typical neutron star parameters
         rho_low = 1e14
         rho_high = 5e15
+        print(f"  No grid provided, using default bracket: [{rho_low:.3e}, {rho_high:.3e}]")
     
     # Define objective function
     def mass_difference(rho_c):
-        _, _, _, _, _, M = integrate_tov_profile(rho_c, rho_arr, P_arr)
-        return M - target_mass_g
+        try:
+            _, _, _, _, _, M = integrate_tov_profile(rho_c, rho_arr, P_arr)
+            diff = M - target_mass_g
+            return diff
+        except Exception as e:
+            print(f"    Error at rho_c={rho_c:.3e}: {e}")
+            return np.inf
+    
+    # Check if bracket is valid
+    f_low = mass_difference(rho_low)
+    f_high = mass_difference(rho_high)
+    
+    print(f"  f(rho_low) = {f_low/2e33:.6f} M☉")
+    print(f"  f(rho_high) = {f_high/2e33:.6f} M☉")
+    
+    if f_low * f_high > 0:
+        # Same sign - try to expand bracket
+        print(f"  Initial bracket has same sign, expanding search...")
+        
+        # Try lower densities
+        if abs(f_low) < abs(f_high):
+            rho_low = max(rho_low * 0.5, rho_arr[0])
+            f_low = mass_difference(rho_low)
+            print(f"  Expanded low: rho={rho_low:.3e}, f={f_low/2e33:.6f} M☉")
+        else:
+            # Try higher densities
+            rho_high = min(rho_high * 1.5, rho_arr[-1])
+            f_high = mass_difference(rho_high)
+            print(f"  Expanded high: rho={rho_high:.3e}, f={f_high/2e33:.6f} M☉")
+        
+        if f_low * f_high > 0:
+            raise ValueError(
+                f"Cannot bracket target mass {target_mass_solar:.3f} M☉. "
+                f"Mass at rho_low={rho_low:.2e}: {(f_low/2e33 + target_mass_solar):.3f} M☉, "
+                f"Mass at rho_high={rho_high:.2e}: {(f_high/2e33 + target_mass_solar):.3f} M☉"
+            )
     
     # Use Brent's method to find root
-    try:
-        rho_c = brentq(mass_difference, rho_low, rho_high, xtol=1e12)
-        return rho_c
-    except ValueError as e:
-        # If bracketing fails, try a broader search
-        print(f"Initial bracketing failed, trying broader search...")
-        rho_c = brentq(mass_difference, 5e13, 1e16, xtol=1e12)
-        return rho_c
-
+    print(f"  Starting Brent's method...")
+    rho_c = brentq(mass_difference, rho_low, rho_high, xtol=1e12, maxiter=100)
+    print(f"  Converged to rho_c = {rho_c:.3e} g/cm³")
+    
+    return rho_c
 def compute_density_profile(eos_name, target_mass_solar):
     """
     Compute density profile for a specific mass
