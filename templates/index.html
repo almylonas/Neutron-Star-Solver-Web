@@ -121,7 +121,95 @@
                 </button>
             </div>
         </div>
-        
+        <!-- Density Profile Section -->
+        <div class="dark-card rounded-xl p-6 shadow-2xl lg:col-span-3">
+            <h2 class="text-xl font-semibold mb-4 text-cyan-300">Density Profile</h2>
+            <p class="text-sm text-gray-400 mb-4">
+                Compute the radial density distribution ρ(r) for a neutron star of specific mass
+            </p>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-300 mb-2">Select EOS</label>
+                    <select id="profile-eos" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2 text-gray-200 focus:ring-2 focus:ring-cyan-400 focus:border-transparent">
+                        <option value="">-- Select EOS --</option>
+                        {% for eos in eos_list %}
+                        <option value="{{ eos.name }}">{{ eos.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-300 mb-2">
+                        Target Mass (M☉)
+                        <span class="text-xs text-gray-500">typically 1.0 - 2.5</span>
+                    </label>
+                    <input 
+                        type="number" 
+                        id="profile-mass" 
+                        value="1.4" 
+                        min="0.5" 
+                        max="3.0" 
+                        step="0.1"
+                        class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2 text-gray-200 focus:ring-2 focus:ring-cyan-400 focus:border-transparent"
+                    >
+                </div>
+                
+                <div class="flex items-end">
+                    <button 
+                        id="compute-profile-btn" 
+                        class="w-full px-6 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 rounded-lg font-medium transition-all duration-200 transform hover:scale-105"
+                    >
+                        Compute Profile
+                    </button>
+                </div>
+            </div>
+            
+            <div id="profile-loading" class="hidden text-center py-4">
+                <div class="inline-flex items-center gap-3 bg-slate-800/80 rounded-full px-6 py-3">
+                    <div class="animate-spin rounded-full h-5 w-5 border-b-2 border-emerald-400"></div>
+                    <p class="text-emerald-300 text-sm font-medium">Computing density profile...</p>
+                </div>
+            </div>
+            
+            <div id="profile-results" class="hidden mt-6">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Central Density</div>
+                        <div id="profile-rho-c" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Radius</div>
+                        <div id="profile-radius" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Final Mass</div>
+                        <div id="profile-mass-final" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Profile Points</div>
+                        <div id="profile-points" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                </div>
+                
+                <div class="space-y-4">
+                    <div id="density-profile-plot" class="bg-slate-800/50 rounded-lg p-4 border border-slate-600"></div>
+                    <div id="mass-profile-plot" class="bg-slate-800/50 rounded-lg p-4 border border-slate-600"></div>
+                </div>
+            </div>
+            
+            <div id="profile-error" class="hidden mt-4 p-4 bg-red-900/30 border border-red-700 rounded-lg">
+                <div class="flex items-start gap-3">
+                    <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <div>
+                        <div class="font-medium text-red-300 mb-1">Error Computing Profile</div>
+                        <div id="profile-error-msg" class="text-sm text-red-200"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
         <!-- Compute Button -->
         <div class="mb-8 text-center">
             <button id="compute-btn" class="px-10 py-4 bg-gradient-to-r from-purple-600 to-cyan-600 hover:from-purple-500 hover:to-cyan-500 rounded-xl font-bold text-lg transition-all duration-300 transform hover:scale-105 shadow-lg">
@@ -265,6 +353,95 @@
                 a.click();
                 document.body.removeChild(a);
                 window.URL.revokeObjectURL(url);
+            });
+        });
+        document.getElementById('compute-profile-btn').addEventListener('click', function() {
+            const eos = document.getElementById('profile-eos').value;
+            const mass = parseFloat(document.getElementById('profile-mass').value);
+            
+            // Validation
+            if (!eos) {
+                alert('Please select an EOS');
+                return;
+            }
+            
+            if (isNaN(mass) || mass < 0.5 || mass > 3.0) {
+                alert('Please enter a valid mass between 0.5 and 3.0 M☉');
+                return;
+            }
+            
+            // Hide previous results/errors
+            document.getElementById('profile-results').classList.add('hidden');
+            document.getElementById('profile-error').classList.add('hidden');
+            
+            // Show loading
+            document.getElementById('profile-loading').classList.remove('hidden');
+            document.getElementById('compute-profile-btn').disabled = true;
+            
+            console.log(`Computing density profile: ${eos}, M = ${mass} M☉`);
+            
+            fetch('/profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ eos: eos, mass: mass })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(errorData => {
+                        throw new Error(errorData.error || 'Server error');
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('Profile computation successful');
+                
+                const profile = data.profile;
+                
+                // Update statistics
+                document.getElementById('profile-rho-c').textContent = 
+                    (profile.rho_c / 1e14).toFixed(2) + ' × 10¹⁴ g/cm³';
+                document.getElementById('profile-radius').textContent = 
+                    profile.R.toFixed(2) + ' km';
+                document.getElementById('profile-mass-final').textContent = 
+                    profile.M.toFixed(3) + ' M☉';
+                document.getElementById('profile-points').textContent = 
+                    profile.r.length;
+                
+                // Plot density profile
+                Plotly.newPlot(
+                    'density-profile-plot',
+                    JSON.parse(data.density_plot).data,
+                    JSON.parse(data.density_plot).layout,
+                    {responsive: true}
+                );
+                
+                // Plot mass profile
+                Plotly.newPlot(
+                    'mass-profile-plot',
+                    JSON.parse(data.mass_plot).data,
+                    JSON.parse(data.mass_plot).layout,
+                    {responsive: true}
+                );
+                
+                // Show results
+                document.getElementById('profile-results').classList.remove('hidden');
+                document.getElementById('profile-loading').classList.add('hidden');
+                document.getElementById('compute-profile-btn').disabled = false;
+                
+                // Scroll to results
+                document.getElementById('profile-results').scrollIntoView({ 
+                    behavior: 'smooth', 
+                    block: 'nearest' 
+                });
+            })
+            .catch(error => {
+                console.error('Profile computation error:', error);
+                
+                document.getElementById('profile-error-msg').textContent = error.message;
+                document.getElementById('profile-error').classList.remove('hidden');
+                document.getElementById('profile-loading').classList.add('hidden');
+                document.getElementById('compute-profile-btn').disabled = false;
             });
         });
         

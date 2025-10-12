@@ -28,6 +28,7 @@ c = 3e10
 c2 = c * c
 TWO_G_C2 = 2 * G / c2
 FOUR_PI = 4.0 * np.pi
+P_SURF = 1e20  # Surface pressure threshold (dyn/cm²)
 
 # EOS Configuration
 EOS_CONFIG = [
@@ -277,7 +278,325 @@ def compute_inertia(m, r):
         traceback.print_exc()
         return np.full_like(m, np.nan) if hasattr(m, '__len__') else np.nan
 
+@jit(nopython=True, fastmath=True)
+def tov_derivatives_profile(r, m, P, rho):
+    """
+    Compute TOV equation derivatives for density profile integration
+    Returns: dm/dr, dP/dr
+    """
+    if r < 1e-10:  # Avoid singularity at r=0
+        return 0.0, 0.0
+    
+    # Energy density ε = ρc²
+    epsilon = rho * c2
+    
+    # dm/dr = 4π r² ε
+    dm_dr = FOUR_PI * r * r * epsilon
+    
+    # dP/dr = -G(ε + P/c²)(m + 4πr³P/c²) / [r(r - 2Gm/c²)]
+    numerator = -G * (epsilon + P / c2) * (m + FOUR_PI * r * r * r * P / c2)
+    denominator = r * (r - TWO_G_C2 * m)
+    
+    if abs(denominator) < 1e-30:  # Avoid division by zero
+        return dm_dr, 0.0
+    
+    dP_dr = numerator / denominator
+    
+    return dm_dr, dP_dr
 
+@jit(nopython=True, fastmath=True)
+def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=1e-4, dr=500.0, max_iter=80000):
+    """
+    Integrate TOV equations to get full density profile
+    
+    Parameters:
+    - rho_c: Central density (g/cm³)
+    - rho_arr, P_arr: EOS arrays
+    - r0: Starting radius in cm (e.g., 10 cm = 1e-4 km)
+    - dr: Step size in cm
+    - max_iter: Maximum iterations
+    
+    Returns:
+    - r_array: Radius array (cm)
+    - m_array: Mass array (g)
+    - P_array: Pressure array (dyn/cm²)
+    - rho_array: Density array (g/cm³)
+    - R_final: Final radius (cm)
+    - M_final: Final mass (g)
+    """
+    # Get central pressure
+    P_c = interp_P(rho_c, rho_arr, P_arr)
+    
+    # Initial conditions at r0
+    r = r0
+    m = (4.0/3.0) * np.pi * r0**3 * rho_c * c2  # m(r0) ≈ (4/3)πr₀³ρc c²
+    P = P_c
+    
+    # Storage arrays (allocate max size)
+    r_arr_out = np.zeros(max_iter)
+    m_arr_out = np.zeros(max_iter)
+    P_arr_out = np.zeros(max_iter)
+    rho_arr_out = np.zeros(max_iter)
+    
+    # Store initial values
+    r_arr_out[0] = r
+    m_arr_out[0] = m
+    P_arr_out[0] = P
+    rho_arr_out[0] = rho_c
+    
+    idx = 1
+    
+    # RK4 integration
+    for i in range(1, max_iter):
+        # Current density
+        rho = interp_rho(P, rho_arr, P_arr)
+        
+        # RK4 step
+        k1_m, k1_P = tov_derivatives_profile(r, m, P, rho)
+        
+        r2 = r + 0.5 * dr
+        m2 = m + 0.5 * dr * k1_m
+        P2 = P + 0.5 * dr * k1_P
+        rho2 = interp_rho(P2, rho_arr, P_arr)
+        k2_m, k2_P = tov_derivatives_profile(r2, m2, P2, rho2)
+        
+        r3 = r + 0.5 * dr
+        m3 = m + 0.5 * dr * k2_m
+        P3 = P + 0.5 * dr * k2_P
+        rho3 = interp_rho(P3, rho_arr, P_arr)
+        k3_m, k3_P = tov_derivatives_profile(r3, m3, P3, rho3)
+        
+        r4 = r + dr
+        m4 = m + dr * k3_m
+        P4 = P + dr * k3_P
+        rho4 = interp_rho(P4, rho_arr, P_arr)
+        k4_m, k4_P = tov_derivatives_profile(r4, m4, P4, rho4)
+        
+        # Update
+        r += dr
+        m += dr * (k1_m + 2*k2_m + 2*k3_m + k4_m) / 6.0
+        P += dr * (k1_P + 2*k2_P + 2*k3_P + k4_P) / 6.0
+        
+        # Stop if pressure drops below surface threshold
+        if P <= P_SURF or P < 0:
+            break
+        
+        # Store values
+        rho_arr_out[idx] = interp_rho(P, rho_arr, P_arr)
+        r_arr_out[idx] = r
+        m_arr_out[idx] = m
+        P_arr_out[idx] = P
+        idx += 1
+    
+    # Return only filled portion
+    return (r_arr_out[:idx], m_arr_out[:idx], P_arr_out[:idx], 
+            rho_arr_out[:idx], r, m)
+
+def find_rho_c_for_mass(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
+    """
+    Find central density that produces the target mass
+    
+    Parameters:
+    - target_mass_solar: Target mass in solar masses
+    - rho_arr, P_arr: EOS arrays
+    - M_rho_grid: Optional pre-computed (rho, M) grid for bracketing
+    
+    Returns:
+    - rho_c: Central density (g/cm³)
+    """
+    target_mass_g = target_mass_solar * 2e33  # Convert to grams
+    
+    # If we have a pre-computed grid, use it for bracketing
+    if M_rho_grid is not None:
+        rho_grid, M_grid = M_rho_grid
+        
+        # Find where M reaches maximum
+        max_idx = np.argmax(M_grid)
+        
+        # Check if target mass is achievable
+        if target_mass_solar > M_grid[max_idx]:
+            raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ exceeds maximum "
+                           f"{M_grid[max_idx]:.3f} M☉ for this EOS")
+        
+        # Find bracketing densities on stable branch
+        stable_rho = rho_grid[:max_idx+1]
+        stable_M = M_grid[:max_idx+1]
+        
+        # Find indices that bracket the target
+        idx = np.searchsorted(stable_M, target_mass_solar)
+        if idx == 0 or idx >= len(stable_M):
+            raise ValueError(f"Cannot bracket target mass {target_mass_solar:.3f} M☉")
+        
+        rho_low = stable_rho[idx-1]
+        rho_high = stable_rho[idx]
+    else:
+        # Use reasonable defaults based on typical neutron star parameters
+        rho_low = 1e14
+        rho_high = 5e15
+    
+    # Define objective function
+    def mass_difference(rho_c):
+        _, _, _, _, _, M = integrate_tov_profile(rho_c, rho_arr, P_arr)
+        return M - target_mass_g
+    
+    # Use Brent's method to find root
+    try:
+        rho_c = brentq(mass_difference, rho_low, rho_high, xtol=1e12)
+        return rho_c
+    except ValueError as e:
+        # If bracketing fails, try a broader search
+        print(f"Initial bracketing failed, trying broader search...")
+        rho_c = brentq(mass_difference, 5e13, 1e16, xtol=1e12)
+        return rho_c
+
+def compute_density_profile(eos_name, target_mass_solar):
+    """
+    Compute density profile for a specific mass
+    
+    Parameters:
+    - eos_name: Name of EOS from cache
+    - target_mass_solar: Target mass in solar masses
+    
+    Returns:
+    - Dictionary with profile data
+    """
+    if eos_name not in eos_cache:
+        raise ValueError(f"EOS {eos_name} not found in cache")
+    
+    rho_eos = eos_cache[eos_name]['rho']
+    P_eos = eos_cache[eos_name]['P']
+    
+    # First, build M(ρc) grid to bracket the solution
+    print(f"Building M(ρc) grid for {eos_name}...")
+    rho_grid = np.concatenate([
+        np.arange(2.5e14, 1e15, 0.5e13),
+        np.arange(1e15, 4e15, 0.5e14)
+    ])
+    
+    results = solve_all_densities(rho_grid, rho_eos, P_eos)
+    M_grid = results[1, :] / 2e33  # Convert to solar masses
+    
+    # Find central density for target mass
+    print(f"Finding ρc for M = {target_mass_solar:.3f} M☉...")
+    rho_c = find_rho_c_for_mass(
+        target_mass_solar, 
+        rho_eos, 
+        P_eos,
+        M_rho_grid=(rho_grid, M_grid)
+    )
+    
+    print(f"Found ρc = {rho_c:.3e} g/cm³")
+    
+    # Integrate to get full profile
+    print("Integrating TOV equations...")
+    r_arr, m_arr, P_arr, rho_arr, R_final, M_final = integrate_tov_profile(
+        rho_c, rho_eos, P_eos
+    )
+    
+    # Convert units
+    r_km = r_arr / 1e5  # cm to km
+    M_solar = m_arr / 2e33  # g to solar masses
+    R_km = R_final / 1e5
+    M_solar_final = M_final / 2e33
+    
+    print(f"Integration complete:")
+    print(f"  Final radius: {R_km:.2f} km")
+    print(f"  Final mass: {M_solar_final:.3f} M☉")
+    print(f"  Profile points: {len(r_km)}")
+    
+    return {
+        'eos_name': eos_name,
+        'target_mass': target_mass_solar,
+        'rho_c': float(rho_c),
+        'R': float(R_km),
+        'M': float(M_solar_final),
+        'r': r_km.tolist(),
+        'rho': rho_arr.tolist(),
+        'P': P_arr.tolist(),
+        'M_r': M_solar.tolist()
+    }
+
+# Add this route to your Flask app
+@app.route('/profile', methods=['POST'])
+def compute_profile():
+    """Compute density profile for specific mass"""
+    try:
+        data = request.get_json()
+        eos_name = data.get('eos')
+        target_mass = float(data.get('mass', 1.4))
+        
+        print(f"\nDensity profile request:")
+        print(f"  EOS: {eos_name}")
+        print(f"  Target mass: {target_mass} M☉")
+        
+        if not eos_name or eos_name not in eos_cache:
+            return jsonify({'error': 'Invalid EOS selected'}), 400
+        
+        # Compute profile
+        profile = compute_density_profile(eos_name, target_mass)
+        
+        # Create density profile plot
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=profile['r'],
+            y=profile['rho'],
+            mode='lines',
+            name='ρ(r)',
+            line=dict(color='#00D9FF', width=3)
+        ))
+        
+        fig.update_layout(
+            title=f"Density Profile: {eos_name} (M = {target_mass:.3f} M☉)",
+            xaxis_title='Radius (km)',
+            yaxis_title='Density ρ (g/cm³)',
+            yaxis_type='log',
+            template='plotly_dark',
+            hovermode='x unified'
+        )
+        
+        plot_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+        
+        # Also create mass profile plot
+        fig_mass = go.Figure()
+        
+        fig_mass.add_trace(go.Scatter(
+            x=profile['r'],
+            y=profile['M_r'],
+            mode='lines',
+            name='M(r)',
+            line=dict(color='#FF6B6B', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(255, 107, 107, 0.2)'
+        ))
+        
+        fig_mass.update_layout(
+            title=f"Enclosed Mass: {eos_name}",
+            xaxis_title='Radius (km)',
+            yaxis_title='Enclosed Mass M(r) (M☉)',
+            template='plotly_dark',
+            hovermode='x unified'
+        )
+        
+        mass_plot_json = json.dumps(fig_mass, cls=plotly.utils.PlotlyJSONEncoder)
+        
+        print(f"  ✓ Profile computed successfully\n")
+        
+        return jsonify({
+            'profile': profile,
+            'density_plot': plot_json,
+            'mass_plot': mass_plot_json
+        })
+    
+    except ValueError as e:
+        print(f"ERROR in profile computation: {str(e)}")
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        print(f"ERROR in profile computation: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    
 def create_plot(results, plot_type):
     """Create Plotly figure based on plot type with proper error handling"""
     try:
@@ -692,7 +1011,95 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </button>
             </div>
         </div>
-        
+        <!-- Density Profile Section -->
+        <div class="dark-card rounded-xl p-6 shadow-2xl lg:col-span-3">
+            <h2 class="text-xl font-semibold mb-4 text-cyan-300">Density Profile</h2>
+            <p class="text-sm text-gray-400 mb-4">
+                Compute the radial density distribution ρ(r) for a neutron star of specific mass
+            </p>
+            
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-300 mb-2">Select EOS</label>
+                    <select id="profile-eos" class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2 text-gray-200 focus:ring-2 focus:ring-cyan-400 focus:border-transparent">
+                        <option value="">-- Select EOS --</option>
+                        {% for eos in eos_list %}
+                        <option value="{{ eos.name }}">{{ eos.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                
+                <div>
+                    <label class="block text-sm font-medium text-gray-300 mb-2">
+                        Target Mass (M☉)
+                        <span class="text-xs text-gray-500">typically 1.0 - 2.5</span>
+                    </label>
+                    <input 
+                        type="number" 
+                        id="profile-mass" 
+                        value="1.4" 
+                        min="0.5" 
+                        max="3.0" 
+                        step="0.1"
+                        class="w-full bg-slate-700 border border-slate-600 rounded-lg px-4 py-2 text-gray-200 focus:ring-2 focus:ring-cyan-400 focus:border-transparent"
+                    >
+                </div>
+                
+                <div class="flex items-end">
+                    <button 
+                        id="compute-profile-btn" 
+                        class="w-full px-6 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 rounded-lg font-medium transition-all duration-200 transform hover:scale-105"
+                    >
+                        Compute Profile
+                    </button>
+                </div>
+            </div>
+            
+            <div id="profile-loading" class="hidden text-center py-4">
+                <div class="inline-flex items-center gap-3 bg-slate-800/80 rounded-full px-6 py-3">
+                    <div class="animate-spin rounded-full h-5 w-5 border-b-2 border-emerald-400"></div>
+                    <p class="text-emerald-300 text-sm font-medium">Computing density profile...</p>
+                </div>
+            </div>
+            
+            <div id="profile-results" class="hidden mt-6">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Central Density</div>
+                        <div id="profile-rho-c" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Radius</div>
+                        <div id="profile-radius" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Final Mass</div>
+                        <div id="profile-mass-final" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                    <div class="bg-slate-700/30 rounded-lg p-4 border border-slate-600">
+                        <div class="text-xs text-gray-400 mb-1">Profile Points</div>
+                        <div id="profile-points" class="text-lg font-bold text-cyan-300">--</div>
+                    </div>
+                </div>
+                
+                <div class="space-y-4">
+                    <div id="density-profile-plot" class="bg-slate-800/50 rounded-lg p-4 border border-slate-600"></div>
+                    <div id="mass-profile-plot" class="bg-slate-800/50 rounded-lg p-4 border border-slate-600"></div>
+                </div>
+            </div>
+            
+            <div id="profile-error" class="hidden mt-4 p-4 bg-red-900/30 border border-red-700 rounded-lg">
+                <div class="flex items-start gap-3">
+                    <svg class="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    <div>
+                        <div class="font-medium text-red-300 mb-1">Error Computing Profile</div>
+                        <div id="profile-error-msg" class="text-sm text-red-200"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
         <!-- Compute Button -->
         <div class="mb-8 text-center">
             <button id="compute-btn" class="px-10 py-4 bg-gradient-to-r from-purple-600 to-cyan-600 hover:from-purple-500 hover:to-cyan-500 rounded-xl font-bold text-lg transition-all duration-300 transform hover:scale-105 shadow-lg">
@@ -836,6 +1243,95 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 a.click();
                 document.body.removeChild(a);
                 window.URL.revokeObjectURL(url);
+            });
+        });
+        document.getElementById('compute-profile-btn').addEventListener('click', function() {
+            const eos = document.getElementById('profile-eos').value;
+            const mass = parseFloat(document.getElementById('profile-mass').value);
+            
+            // Validation
+            if (!eos) {
+                alert('Please select an EOS');
+                return;
+            }
+            
+            if (isNaN(mass) || mass < 0.5 || mass > 3.0) {
+                alert('Please enter a valid mass between 0.5 and 3.0 M☉');
+                return;
+            }
+            
+            // Hide previous results/errors
+            document.getElementById('profile-results').classList.add('hidden');
+            document.getElementById('profile-error').classList.add('hidden');
+            
+            // Show loading
+            document.getElementById('profile-loading').classList.remove('hidden');
+            document.getElementById('compute-profile-btn').disabled = true;
+            
+            console.log(`Computing density profile: ${eos}, M = ${mass} M☉`);
+            
+            fetch('/profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ eos: eos, mass: mass })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(errorData => {
+                        throw new Error(errorData.error || 'Server error');
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('Profile computation successful');
+                
+                const profile = data.profile;
+                
+                // Update statistics
+                document.getElementById('profile-rho-c').textContent = 
+                    (profile.rho_c / 1e14).toFixed(2) + ' × 10¹⁴ g/cm³';
+                document.getElementById('profile-radius').textContent = 
+                    profile.R.toFixed(2) + ' km';
+                document.getElementById('profile-mass-final').textContent = 
+                    profile.M.toFixed(3) + ' M☉';
+                document.getElementById('profile-points').textContent = 
+                    profile.r.length;
+                
+                // Plot density profile
+                Plotly.newPlot(
+                    'density-profile-plot',
+                    JSON.parse(data.density_plot).data,
+                    JSON.parse(data.density_plot).layout,
+                    {responsive: true}
+                );
+                
+                // Plot mass profile
+                Plotly.newPlot(
+                    'mass-profile-plot',
+                    JSON.parse(data.mass_plot).data,
+                    JSON.parse(data.mass_plot).layout,
+                    {responsive: true}
+                );
+                
+                // Show results
+                document.getElementById('profile-results').classList.remove('hidden');
+                document.getElementById('profile-loading').classList.add('hidden');
+                document.getElementById('compute-profile-btn').disabled = false;
+                
+                // Scroll to results
+                document.getElementById('profile-results').scrollIntoView({ 
+                    behavior: 'smooth', 
+                    block: 'nearest' 
+                });
+            })
+            .catch(error => {
+                console.error('Profile computation error:', error);
+                
+                document.getElementById('profile-error-msg').textContent = error.message;
+                document.getElementById('profile-error').classList.remove('hidden');
+                document.getElementById('profile-loading').classList.add('hidden');
+                document.getElementById('compute-profile-btn').disabled = false;
             });
         });
         
