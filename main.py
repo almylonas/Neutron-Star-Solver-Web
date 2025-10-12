@@ -215,8 +215,7 @@ def ns_solve_numba(rho_0, rho_arr, P_arr, dr=500.0, max_iter=80000, tol=1e-10):
             idx += 1
     
     # Return profile arrays (trimmed) plus final R and M
-    return (r_profile[:idx], m_profile[:idx], P_profile[:idx], 
-            rho_profile[:idx], r, m)
+        return r, m, P
 
 @jit(nopython=True, parallel=True, fastmath=True)
 def solve_all_densities(rho_array, rho_eos, P_eos):
