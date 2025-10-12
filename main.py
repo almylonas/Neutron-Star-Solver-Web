@@ -227,13 +227,56 @@ def compute_eos(eos_name, rho_arr, P_arr):
     }
 
 def compute_inertia(m, r):
-    """Compute moment of inertia with error handling"""
+    """Compute moment of inertia with robust error handling"""
     try:
-        return (0.237 + 0.008) * m * r**2 * 1.989e43 * (1 + 4.2*(m/r) + 90*(m/r)**4) / 1e45
+        # Ensure inputs are numpy arrays
+        m = np.asarray(m, dtype=np.float64)
+        r = np.asarray(r, dtype=np.float64)
+        
+        # Filter out invalid values before computation
+        valid_mask = (m > 0) & (r > 0) & np.isfinite(m) & np.isfinite(r)
+        
+        if not np.any(valid_mask):
+            print("Warning: No valid M,R pairs for inertia computation")
+            return np.array([])
+        
+        # Apply mask
+        m_valid = m[valid_mask]
+        r_valid = r[valid_mask]
+        
+        # Compute compactness (dimensionless)
+        # M is in solar masses, R is in km
+        # Convert to geometric units: M_sun = 1.477 km in geometric units
+        m_km = m_valid * 1.477  # Convert solar masses to km (geometric units)
+        compactness = m_km / r_valid
+        
+        # Avoid extreme compactness values that cause numerical issues
+        compactness = np.clip(compactness, 0, 0.5)  # Max compactness ~0.5 for neutron stars
+        
+        # Compute moment of inertia
+        # I = k * M * R^2 where k depends on compactness
+        k = 0.237 + 0.008  # Base value
+        k = k * (1 + 4.2 * compactness + 90 * compactness**4)
+        
+        # I in units of 10^45 g·cm²
+        # M in M_sun (1.989e33 g), R in km (1e5 cm)
+        I = k * m_valid * (r_valid * 1e5)**2 * 1.989e33 / 1e45
+        
+        # Final safety check
+        I = np.where(np.isfinite(I) & (I > 0), I, np.nan)
+        
+        # Create full result array with NaN for invalid entries
+        result = np.full_like(m, np.nan, dtype=np.float64)
+        result[valid_mask] = I
+        
+        return result
+        
     except Exception as e:
         print(f"Error in inertia computation: {e}")
-        # Return zeros or fallback values
-        return np.zeros_like(m) if hasattr(m, '__len__') else 0.0
+        import traceback
+        traceback.print_exc()
+        return np.full_like(m, np.nan) if hasattr(m, '__len__') else np.nan
+
 
 def create_plot(results, plot_type):
     """Create Plotly figure based on plot type with proper error handling"""
@@ -241,7 +284,6 @@ def create_plot(results, plot_type):
         fig = go.Figure()
         
         if not results:
-            # Return empty plot if no results
             fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
             return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
         
@@ -302,31 +344,66 @@ def create_plot(results, plot_type):
             )
         
         elif plot_type == 'inertia':
+            traces_added = 0
             for result in results:
                 try:
-                    if 'M' in result and 'R' in result and len(result['M']) > 0 and len(result['R']) > 0:
-                        M = np.array(result['M'])
-                        R = np.array(result['R'])
-                        max_idx = np.argmax(M)
-                        M_stable = M[:max_idx+1]
-                        R_stable = R[:max_idx+1]
+                    if 'M' not in result or 'R' not in result:
+                        print(f"Skipping {result.get('name', 'unknown')}: Missing M or R data")
+                        continue
+                    
+                    M = np.array(result['M'])
+                    R = np.array(result['R'])
+                    
+                    if len(M) == 0 or len(R) == 0:
+                        print(f"Skipping {result.get('name', 'unknown')}: Empty arrays")
+                        continue
+                    
+                    # Find stable branch (up to maximum mass)
+                    max_idx = np.argmax(M)
+                    if max_idx < 2:  # Need at least a few points
+                        print(f"Skipping {result.get('name', 'unknown')}: Insufficient stable points")
+                        continue
+                    
+                    M_stable = M[:max_idx+1]
+                    R_stable = R[:max_idx+1]
+                    
+                    print(f"Computing inertia for {result.get('name', 'unknown')}: {len(M_stable)} points")
+                    print(f"  M range: [{M_stable.min():.3f}, {M_stable.max():.3f}]")
+                    print(f"  R range: [{R_stable.min():.3f}, {R_stable.max():.3f}]")
+                    
+                    # Compute inertia
+                    I = compute_inertia(M_stable, R_stable)
+                    
+                    # Filter valid values (not NaN, not Inf, positive)
+                    valid_mask = np.isfinite(I) & (I > 0) & (I < 1000)  # Sanity check on upper bound
+                    
+                    valid_count = np.sum(valid_mask)
+                    print(f"  Valid inertia points: {valid_count}/{len(I)}")
+                    
+                    if valid_count > 0:
+                        M_plot = M_stable[valid_mask]
+                        I_plot = I[valid_mask]
                         
-                        if len(M_stable) > 0 and len(R_stable) > 0:
-                            I = compute_inertia(M_stable, R_stable)
-                            
-                            # Filter out invalid values
-                            valid_mask = ~np.isnan(I) & ~np.isinf(I) & (I > 0)
-                            if np.any(valid_mask):
-                                fig.add_trace(go.Scatter(
-                                    x=M_stable[valid_mask],
-                                    y=I[valid_mask],
-                                    mode='lines',
-                                    name=result['name'],
-                                    line=dict(color=result.get('color', '#000000'), width=2)
-                                ))
+                        print(f"  I range: [{I_plot.min():.2f}, {I_plot.max():.2f}]")
+                        
+                        fig.add_trace(go.Scatter(
+                            x=M_plot.tolist(),
+                            y=I_plot.tolist(),
+                            mode='lines',
+                            name=result['name'],
+                            line=dict(color=result.get('color', '#000000'), width=2)
+                        ))
+                        traces_added += 1
+                    else:
+                        print(f"  No valid inertia values for {result.get('name', 'unknown')}")
+                    
                 except Exception as e:
-                    print(f"Error in inertia plot for {result.get('name', 'unknown')}: {e}")
+                    print(f"Error computing inertia for {result.get('name', 'unknown')}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     continue
+            
+            print(f"Total traces added to inertia plot: {traces_added}")
             
             fig.update_layout(
                 title='Moment of Inertia',
@@ -337,17 +414,19 @@ def create_plot(results, plot_type):
             )
         
         else:
-            # Invalid plot type
             fig.add_annotation(text=f"Invalid plot type: {plot_type}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
         
         # Ensure we have at least one trace
         if len(fig.data) == 0:
             fig.add_annotation(text="No valid data to display", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+            print("WARNING: No traces added to plot!")
         
         return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
     
     except Exception as e:
         print(f"Error in create_plot: {e}")
+        import traceback
+        traceback.print_exc()
         # Return a basic error plot
         fig = go.Figure()
         fig.add_annotation(text=f"Error creating plot: {str(e)}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
