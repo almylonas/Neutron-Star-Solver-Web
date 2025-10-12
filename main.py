@@ -153,12 +153,29 @@ def compute_derivatives(r, m, P, rho):
 
 @jit(nopython=True, fastmath=True)
 def ns_solve_numba(rho_0, rho_arr, P_arr, dr=500.0, max_iter=80000, tol=1e-10):
-    """Ultra-fast RK4 solver with Numba JIT compilation"""
+    """
+    Enhanced version of ns_solve_numba that returns full profile arrays
+    Uses the SAME integration logic as your working ns_solve_numba
+    """
     P_0 = interp_P(rho_0, rho_arr, P_arr)
     
     r = 500.0
     m = 1.0
     P = P_0
+    
+    # Storage for profile
+    r_profile = np.zeros(max_iter)
+    m_profile = np.zeros(max_iter)
+    P_profile = np.zeros(max_iter)
+    rho_profile = np.zeros(max_iter)
+    
+    # Store initial values
+    r_profile[0] = r
+    m_profile[0] = m
+    P_profile[0] = P
+    rho_profile[0] = rho_0
+    
+    idx = 1
     
     for i in range(max_iter):
         rho1 = interp_rho(P, rho_arr, P_arr)
@@ -188,8 +205,18 @@ def ns_solve_numba(rho_0, rho_arr, P_arr, dr=500.0, max_iter=80000, tol=1e-10):
         
         if P / P_0 < tol or P < 0:
             break
+        
+        # Store profile data
+        if idx < max_iter:
+            r_profile[idx] = r
+            m_profile[idx] = m
+            P_profile[idx] = P
+            rho_profile[idx] = interp_rho(P, rho_arr, P_arr)
+            idx += 1
     
-    return r, m, P
+    # Return profile arrays (trimmed) plus final R and M
+    return (r_profile[:idx], m_profile[:idx], P_profile[:idx], 
+            rho_profile[:idx], r, m)
 
 @jit(nopython=True, parallel=True, fastmath=True)
 def solve_all_densities(rho_array, rho_eos, P_eos):
