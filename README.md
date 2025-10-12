@@ -43,7 +43,9 @@ Each CSV file must include at least these columns:
    cd neutron-star-solver
    ```
 2. **Install dependenced**
+    ```bash
     pip install -r requirements.txt
+    ```
 3. **Running the web app**
     ```bash
    python main.py
