@@ -486,158 +486,135 @@ def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80
     return (r_arr_out[:idx], m_arr_out[:idx], P_arr_out[:idx], 
             rho_arr_out[:idx], r, m)
 
-def find_rho_c_for_mass(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
+def find_rho_c_for_mass(target_mass_solar, rho_arr, P_arr, M_rho_grid):
     """
-    Find central density for target mass - CORRECTED VERSION
+    Find central density for target mass
+    Uses the existing working solver
     """
-    target_mass_g = target_mass_solar * 2e33
+    rho_grid, M_grid = M_rho_grid
     
-    if M_rho_grid is not None:
-        rho_grid, M_grid = M_rho_grid
-        max_idx = np.argmax(M_grid)
-        M_max = M_grid[max_idx]
-        
-        print(f"  M_max for this EOS: {M_max:.3f} M☉")
-        print(f"  Target mass: {target_mass_solar:.3f} M☉")
-        
-        if target_mass_solar > M_max:
-            raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ exceeds maximum "
-                           f"{M_max:.3f} M☉ for this EOS")
-        
-        M_min = M_grid[0]
-        if target_mass_solar < M_min:
-            raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ is below minimum "
-                           f"{M_min:.3f} M☉ for this EOS")
-        
-        stable_rho = rho_grid[:max_idx+1]
-        stable_M = M_grid[:max_idx+1]
-        
-        idx = np.searchsorted(stable_M, target_mass_solar)
-        
-        if idx == 0:
-            rho_low = stable_rho[0]
-            rho_high = stable_rho[1]
-        elif idx >= len(stable_M):
-            rho_low = stable_rho[-2]
-            rho_high = stable_rho[-1]
-        else:
-            rho_low = stable_rho[idx-1]
-            rho_high = stable_rho[idx]
-        
-        print(f"  Bracketing: rho_c ∈ [{rho_low:.3e}, {rho_high:.3e}] g/cm³")
+    # Find maximum mass
+    max_idx = np.argmax(M_grid)
+    M_max = M_grid[max_idx]
+    M_min = M_grid[0]
+    
+    print(f"  EOS mass range: [{M_min:.3f}, {M_max:.3f}] M☉")
+    print(f"  Target mass: {target_mass_solar:.3f} M☉")
+    
+    if target_mass_solar > M_max:
+        raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ exceeds maximum {M_max:.3f} M☉")
+    
+    if target_mass_solar < M_min:
+        raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ is below minimum {M_min:.3f} M☉")
+    
+    # Use stable branch only
+    stable_rho = rho_grid[:max_idx+1]
+    stable_M = M_grid[:max_idx+1]
+    
+    # Find bracketing indices
+    idx = np.searchsorted(stable_M, target_mass_solar)
+    
+    if idx == 0:
+        rho_low = stable_rho[0]
+        rho_high = stable_rho[min(1, len(stable_rho)-1)]
+    elif idx >= len(stable_M):
+        rho_low = stable_rho[-2]
+        rho_high = stable_rho[-1]
     else:
-        rho_low = 1e14
-        rho_high = 5e15
+        rho_low = stable_rho[idx-1]
+        rho_high = stable_rho[idx]
     
+    print(f"  Bracket: ρ ∈ [{rho_low:.3e}, {rho_high:.3e}] g/cm³")
+    
+    # Define objective function using existing solver
     def mass_difference(rho_c):
-        try:
-            _, _, _, _, _, M = integrate_tov_profile(rho_c, rho_arr, P_arr)
-            diff = M - target_mass_g
-            return diff
-        except Exception as e:
-            print(f"    Error at rho_c={rho_c:.3e}: {e}")
-            return np.inf
+        r, m, P = ns_solve_numba(rho_c, rho_arr, P_arr)
+        M_solar = m / 2e33
+        diff = M_solar - target_mass_solar
+        return diff
     
+    # Check bracket validity
     f_low = mass_difference(rho_low)
     f_high = mass_difference(rho_high)
     
-    print(f"  f(rho_low) = {f_low/2e33:.6f} M☉")
-    print(f"  f(rho_high) = {f_high/2e33:.6f} M☉")
+    print(f"  f(ρ_low) = {f_low:.6f} M☉")
+    print(f"  f(ρ_high) = {f_high:.6f} M☉")
     
     if f_low * f_high > 0:
-        print(f"  Initial bracket has same sign, expanding search...")
-        
+        # Try to expand bracket
+        print(f"  Expanding bracket...")
         if abs(f_low) < abs(f_high):
-            rho_low = max(rho_low * 0.5, rho_arr[0])
+            rho_low = rho_low * 0.8
             f_low = mass_difference(rho_low)
-            print(f"  Expanded low: rho={rho_low:.3e}, f={f_low/2e33:.6f} M☉")
         else:
-            rho_high = min(rho_high * 1.5, rho_arr[-1])
+            rho_high = rho_high * 1.2
             f_high = mass_difference(rho_high)
-            print(f"  Expanded high: rho={rho_high:.3e}, f={f_high/2e33:.6f} M☉")
         
         if f_low * f_high > 0:
             raise ValueError(
-                f"Cannot bracket target mass {target_mass_solar:.3f} M☉. "
-                f"Mass at rho_low={rho_low:.2e}: {(f_low/2e33 + target_mass_solar):.3f} M☉, "
-                f"Mass at rho_high={rho_high:.2e}: {(f_high/2e33 + target_mass_solar):.3f} M☉"
+                f"Cannot bracket target mass. "
+                f"M(ρ_low) = {f_low + target_mass_solar:.3f} M☉, "
+                f"M(ρ_high) = {f_high + target_mass_solar:.3f} M☉"
             )
     
-    print(f"  Starting Brent's method...")
+    # Use Brent's method
+    print(f"  Running root finder...")
     rho_c = brentq(mass_difference, rho_low, rho_high, xtol=1e12, maxiter=100)
-    print(f"  Converged to rho_c = {rho_c:.3e} g/cm³")
+    print(f"  Found ρc = {rho_c:.3e} g/cm³")
     
     return rho_c
 
+
 def compute_density_profile(eos_name, target_mass_solar):
-    """Compute density profile for a specific mass"""
+    """
+    Compute density profile for a specific neutron star mass
+    """
     if eos_name not in eos_cache:
-        raise ValueError(f"EOS {eos_name} not found in cache")
+        raise ValueError(f"EOS {eos_name} not found")
     
     rho_eos = eos_cache[eos_name]['rho']
     P_eos = eos_cache[eos_name]['P']
     
-    # Debug: Print EOS range
-    print(f"\nEOS {eos_name} range:")
-    print(f"  ρ: [{rho_eos[0]:.3e}, {rho_eos[-1]:.3e}] g/cm³")
-    print(f"  P: [{P_eos[0]:.3e}, {P_eos[-1]:.3e}] dyn/cm²")
+    print(f"\nComputing profile for {eos_name}, M = {target_mass_solar:.3f} M☉")
     
-    print(f"Building M(ρc) grid for {eos_name}...")
+    # Step 1: Build M(ρc) curve using existing solver
+    print(f"Building M(ρc) curve...")
     rho_grid = np.concatenate([
         np.arange(2.5e14, 1e15, 0.5e13),
         np.arange(1e15, 4e15, 0.5e14)
     ])
     
-    # Filter rho_grid to be within EOS range
-    rho_grid = rho_grid[(rho_grid >= rho_eos[0]) & (rho_grid <= rho_eos[-1])]
-    print(f"  Using {len(rho_grid)} density points in range")
-    
-    if len(rho_grid) < 2:
-        raise ValueError(f"Not enough valid density points for EOS {eos_name}")
-    
+    # Use your existing fast solver
     results = solve_all_densities(rho_grid, rho_eos, P_eos)
-    M_grid = results[1, :] / 2e33
+    M_grid = results[1, :] / 2e33  # Convert to solar masses
     
-    # Debug: Check for inf/nan in M_grid
-    valid_mask = np.isfinite(M_grid) & (M_grid > 0)
-    if not np.any(valid_mask):
-        raise ValueError(f"No valid masses computed for EOS {eos_name}. Check EOS data.")
+    print(f"  Computed {len(M_grid)} mass points")
+    print(f"  Mass range: [{np.min(M_grid):.3f}, {np.max(M_grid):.3f}] M☉")
     
-    print(f"  Valid mass results: {np.sum(valid_mask)}/{len(M_grid)}")
-    print(f"  M range: [{M_grid[valid_mask].min():.3f}, {M_grid[valid_mask].max():.3f}] M☉")
-    
-    # Use only valid points
-    rho_grid = rho_grid[valid_mask]
-    M_grid = M_grid[valid_mask]
-    
-    print(f"Finding ρc for M = {target_mass_solar:.3f} M☉...")
-    rho_c = find_rho_c_for_mass(
-        target_mass_solar, 
-        rho_eos, 
+    # Step 2: Find ρc for target mass
+    rho_c = find_rho_c_for_mass_v3(
+        target_mass_solar,
+        rho_eos,
         P_eos,
-        M_rho_grid=(rho_grid, M_grid)
+        (rho_grid, M_grid)
     )
     
-    print(f"Found ρc = {rho_c:.3e} g/cm³")
-    
-    print("Integrating TOV equations...")
-    r_arr, m_arr, P_arr, rho_arr, R_final, M_final = integrate_tov_profile(
+    # Step 3: Integrate with profile storage
+    print(f"Integrating with profile storage...")
+    r_arr, m_arr, P_arr, rho_arr, R_final, M_final = ns_solve_profile(
         rho_c, rho_eos, P_eos
     )
     
-    # Check for inf/nan
-    if not np.isfinite(M_final) or M_final <= 0:
-        raise ValueError(f"Integration failed: M_final = {M_final}")
-    
-    r_km = r_arr / 1e5
-    M_solar = m_arr / 2e33
+    # Convert units
+    r_km = r_arr / 1e5  # cm to km
+    M_solar = m_arr / 2e33  # g to solar masses
     R_km = R_final / 1e5
     M_solar_final = M_final / 2e33
     
-    print(f"Integration complete:")
-    print(f"  Final radius: {R_km:.2f} km")
-    print(f"  Final mass: {M_solar_final:.3f} M☉")
-    print(f"  Profile points: {len(r_km)}")
+    print(f"Profile complete:")
+    print(f"  R = {R_km:.2f} km")
+    print(f"  M = {M_solar_final:.3f} M☉")
+    print(f"  Points: {len(r_km)}\n")
     
     return {
         'eos_name': eos_name,
@@ -660,13 +637,16 @@ def compute_profile():
         eos_name = data.get('eos')
         target_mass = float(data.get('mass', 1.4))
         
-        print(f"\nDensity profile request:")
+        print(f"\n{'='*60}")
+        print(f"DENSITY PROFILE REQUEST")
         print(f"  EOS: {eos_name}")
         print(f"  Target mass: {target_mass} M☉")
+        print(f"{'='*60}")
         
         if not eos_name or eos_name not in eos_cache:
             return jsonify({'error': 'Invalid EOS selected'}), 400
         
+        # Compute profile
         profile = compute_density_profile(eos_name, target_mass)
         
         # Create density profile plot
@@ -679,12 +659,13 @@ def compute_profile():
             line=dict(color='#00D9FF', width=3)
         ))
         fig.update_layout(
-            title=f"Density Profile: {eos_name} (M = {target_mass:.3f} M☉)",
+            title=f"Density Profile: {eos_name} (M = {target_mass:.3f} M☉, ρc = {profile['rho_c']:.2e} g/cm³)",
             xaxis_title='Radius (km)',
             yaxis_title='Density ρ (g/cm³)',
             yaxis_type='log',
             template='plotly_dark',
-            hovermode='x unified'
+            hovermode='x unified',
+            height=500
         )
         plot_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
         
@@ -700,15 +681,18 @@ def compute_profile():
             fillcolor='rgba(255, 107, 107, 0.2)'
         ))
         fig_mass.update_layout(
-            title=f"Enclosed Mass: {eos_name}",
+            title=f"Enclosed Mass Profile: {eos_name} (R = {profile['R']:.2f} km)",
             xaxis_title='Radius (km)',
             yaxis_title='Enclosed Mass M(r) (M☉)',
             template='plotly_dark',
-            hovermode='x unified'
+            hovermode='x unified',
+            height=500
         )
         mass_plot_json = json.dumps(fig_mass, cls=plotly.utils.PlotlyJSONEncoder)
         
-        print(f"  ✓ Profile computed successfully\n")
+        print(f"{'='*60}")
+        print(f"SUCCESS - Profile computed")
+        print(f"{'='*60}\n")
         
         return jsonify({
             'profile': profile,
@@ -717,12 +701,13 @@ def compute_profile():
         })
     
     except ValueError as e:
-        print(f"ERROR in profile computation: {str(e)}")
+        print(f"VALUE ERROR: {str(e)}\n")
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        print(f"ERROR in profile computation: {str(e)}")
+        print(f"UNEXPECTED ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
+        print()
         return jsonify({'error': str(e)}), 500
     
 def create_plot(results, plot_type):
