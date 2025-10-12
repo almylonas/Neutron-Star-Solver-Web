@@ -306,14 +306,14 @@ def tov_derivatives_profile(r, m, P, rho):
     return dm_dr, dP_dr
 
 @jit(nopython=True, fastmath=True)
-def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=1e-4, dr=500.0, max_iter=80000):
+def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80000):
     """
     Integrate TOV equations to get full density profile
     
     Parameters:
     - rho_c: Central density (g/cm³)
     - rho_arr, P_arr: EOS arrays
-    - r0: Starting radius in cm (e.g., 10 cm = 1e-4 km)
+    - r0: Starting radius in cm (e.g., 500 cm = 0.005 km)
     - dr: Step size in cm
     - max_iter: Maximum iterations
     
@@ -330,7 +330,8 @@ def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=1e-4, dr=500.0, max_iter=800
     
     # Initial conditions at r0
     r = r0
-    m = (4.0/3.0) * np.pi * r0**3 * rho_c * c2  # m(r0) ≈ (4/3)πr₀³ρc c²
+    # Energy density ε = ρc², mass in grams
+    m = (4.0/3.0) * np.pi * r0**3 * rho_c  # m(r0) ≈ (4/3)πr₀³ρc (NOT ρc c²)
     P = P_c
     
     # Storage arrays (allocate max size)
