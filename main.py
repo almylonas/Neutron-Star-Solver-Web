@@ -14,6 +14,7 @@ import json
 import io
 import os
 from werkzeug.utils import secure_filename
+from scipy.optimize import brentq
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
