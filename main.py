@@ -225,7 +225,9 @@ def compute_eos(eos_name, rho_arr, P_arr):
         'R': R.tolist(),
         'M': M.tolist(),
         'max_mass': float(np.max(M)),
-        'max_radius': float(R[np.argmax(M)])
+        'max_radius': float(R[np.argmax(M)]),
+        'raw_rho': rho_arr.tolist(),  # Store raw EOS data
+        'raw_P': P_arr.tolist()       # Store raw EOS data
     }
 
 def compute_inertia(m, r):
@@ -633,6 +635,26 @@ def create_plot(results, plot_type):
                 template='plotly_dark'
             )
         
+        elif plot_type == 'eos':
+            # NEW: Plot raw EoS data with logarithmic axes
+            for result in results:
+                if 'raw_rho' in result and 'raw_P' in result and len(result['raw_rho']) > 0 and len(result['raw_P']) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=result['raw_rho'],
+                        y=result['raw_P'],
+                        mode='lines',
+                        name=result['name'],
+                        line=dict(color=result.get('color', '#000000'), width=2)
+                    ))
+            fig.update_layout(
+                title='Equation of State: Pressure vs Density',
+                xaxis_title='ρ (g/cm³)',
+                yaxis_title='P (dyn/cm²)',
+                xaxis_type='log',
+                yaxis_type='log',
+                template='plotly_dark'
+            )
+        
         else:
             fig.add_annotation(text=f"Invalid plot type: {plot_type}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
         
@@ -651,6 +673,64 @@ def create_plot(results, plot_type):
         fig = go.Figure()
         fig.add_annotation(text=f"Error creating plot: {str(e)}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
         return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+
+def generate_csv_data(results, plot_type):
+    """Generate CSV data for the selected plot type"""
+    if not results:
+        return "No data available"
+    
+    csv_lines = []
+    
+    if plot_type == 'mass-rho':
+        csv_lines.append("EOS,Central Density (g/cm³),Mass (M☉)")
+        for result in results:
+            if 'rho' in result and 'M' in result:
+                for rho, mass in zip(result['rho'], result['M']):
+                    csv_lines.append(f"{result['name']},{rho},{mass}")
+    
+    elif plot_type == 'radius-rho':
+        csv_lines.append("EOS,Central Density (g/cm³),Radius (km)")
+        for result in results:
+            if 'rho' in result and 'R' in result:
+                for rho, radius in zip(result['rho'], result['R']):
+                    csv_lines.append(f"{result['name']},{rho},{radius}")
+    
+    elif plot_type == 'mass-radius':
+        csv_lines.append("EOS,Radius (km),Mass (M☉)")
+        for result in results:
+            if 'R' in result and 'M' in result:
+                for radius, mass in zip(result['R'], result['M']):
+                    csv_lines.append(f"{result['name']},{radius},{mass}")
+    
+    elif plot_type == 'inertia':
+        csv_lines.append("EOS,Mass (M☉),Inertia (10⁴⁵ g·cm²)")
+        for result in results:
+            if 'M' in result and 'R' in result:
+                M = np.array(result['M'])
+                R = np.array(result['R'])
+                
+                # Find stable branch
+                max_idx = np.argmax(M)
+                if max_idx >= 2:
+                    M_stable = M[:max_idx+1]
+                    R_stable = R[:max_idx+1]
+                    I = compute_inertia(M_stable, R_stable)
+                    
+                    for mass, inertia in zip(M_stable, I):
+                        if np.isfinite(inertia) and inertia > 0:
+                            csv_lines.append(f"{result['name']},{mass},{inertia}")
+    
+    elif plot_type == 'eos':
+        csv_lines.append("EOS,Density (g/cm³),Pressure (dyn/cm²)")
+        for result in results:
+            if 'raw_rho' in result and 'raw_P' in result:
+                for rho, pressure in zip(result['raw_rho'], result['raw_P']):
+                    csv_lines.append(f"{result['name']},{rho},{pressure}")
+    
+    else:
+        return f"Unknown plot type: {plot_type}"
+    
+    return "\n".join(csv_lines)
 
 # Routes
 @app.route('/')
@@ -694,44 +774,17 @@ def compute():
             )
             result['color'] = eos_cache[eos_name]['color']
             results.append(result)
-            print(f"    ✓ Max mass: {result['max_mass']:.3f} M☉")
-            print(f"    ✓ Data points: {len(result['M'])}")
+            print(f"    ✓ Max mass: {result['max_mass']:.3f} M☉, Max radius: {result['max_radius']:.3f} km")
         
-        if not results:
-            return jsonify({'error': 'No valid EOS could be computed'}), 400
-        
-        # Debug inertia specifically
-        if plot_type == 'inertia':
-            print(f"DEBUG: Creating inertia plot with {len(results)} results")
-            for i, result in enumerate(results):
-                M = np.array(result['M'])
-                R = np.array(result['R'])
-                max_idx = np.argmax(M)
-                print(f"  Result {i}: {result['name']}")
-                print(f"    Total points: {len(M)}, Stable branch: {max_idx+1}")
-                print(f"    M range: {M.min():.3f} to {M.max():.3f}")
-                print(f"    R range: {R.min():.3f} to {R.max():.3f}")
-        
-        # Create plot
         plot_json = create_plot(results, plot_type)
-        
-        # Prepare statistics
-        stats = [{
-            'name': r['name'],
-            'max_mass': f"{r['max_mass']:.3f}",
-            'radius': f"{r['max_radius']:.2f}"
-        } for r in results]
-        
-        print(f"  ✓ Computation complete - Plot type: {plot_type}\n")
         
         return jsonify({
             'plot': plot_json,
-            'stats': stats,
             'results': results
         })
-    
+        
     except Exception as e:
-        print(f"ERROR in compute: {str(e)}")
+        print(f"Error in compute: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -771,318 +824,39 @@ def upload_file():
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
-@app.route('/download', methods=['POST'])
-def download():
-    """Download results as CSV"""
-    data = request.get_json()
-    stats = data.get('stats', [])
-    
-    csv_content = "EOS,Max Mass (M☉),Radius (km)\n"
-    for stat in stats:
-        csv_content += f"{stat['name']},{stat['max_mass']},{stat['radius']}\n"
-    
-    return send_file(
-        io.BytesIO(csv_content.encode()),
-        mimetype='text/csv',
-        as_attachment=True,
-        download_name='neutron_star_results.csv'
-    )
+@app.route('/download_csv', methods=['POST'])
+def download_csv():
+    """Download CSV with the calculated data of the selected plot type"""
+    try:
+        data = request.get_json()
+        results = data.get('results', [])
+        plot_type = data.get('plot_type', 'mass-radius')
+        
+        if not results:
+            return jsonify({'error': 'No data available for download'}), 400
+        
+        csv_data = generate_csv_data(results, plot_type)
+        
+        # Create in-memory file
+        output = io.StringIO()
+        output.write(csv_data)
+        
+        return send_file(
+            io.BytesIO(output.getvalue().encode('utf-8')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=f'neutron_star_{plot_type}_data.csv'
+        )
+        
+    except Exception as e:
+        print(f"Error in download_csv: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
-# HTML Template
-HTML_TEMPLATE = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Neutron Star Solver</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { 
-            background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
-            min-height: 100vh;
-        }
-        .dark-card {
-            background: rgba(30, 41, 59, 0.8);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(71, 85, 105, 0.5);
-        }
-        .dark-card:hover {
-            border-color: rgba(100, 116, 139, 0.7);
-            transition: border-color 0.3s ease;
-        }
-        .checkbox-label:hover {
-            background: rgba(51, 65, 85, 0.5);
-        }
-        .scrollbar-custom::-webkit-scrollbar {
-            width: 6px;
-        }
-        .scrollbar-custom::-webkit-scrollbar-track {
-            background: rgba(30, 41, 59, 0.5);
-            border-radius: 3px;
-        }
-        .scrollbar-custom::-webkit-scrollbar-thumb {
-            background: rgba(100, 116, 139, 0.6);
-            border-radius: 3px;
-        }
-        .scrollbar-custom::-webkit-scrollbar-thumb:hover {
-            background: rgba(148, 163, 184, 0.8);
-        }
-    </style>
-</head>
-<body class="text-gray-100 p-4 md:p-8">
-    <div class="max-w-7xl mx-auto">
-        <!-- Header -->
-        <div class="text-center mb-8">
-            <h1 class="text-4xl md:text-5xl font-bold mb-3 bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 to-purple-400">
-                Neutron Star Solver
-            </h1>
-            <p class="text-lg text-gray-400 max-w-2xl mx-auto">
-                TOV Equation Solver for Various Equations of State - Explore the properties of neutron stars
-            </p>
-        </div>
-        
-        <!-- Main Grid -->
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-            <!-- EOS Selection -->
-            <div class="dark-card rounded-xl p-6 shadow-2xl">
-                <h2 class="text-xl font-semibold mb-4 text-cyan-300">Select EOS</h2>
-                <div id="eos-list" class="space-y-2 mb-4 max-h-96 overflow-y-auto scrollbar-custom pr-2">
-                    {% for eos in eos_list %}
-                    <label class="checkbox-label flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all duration-200">
-                        <input type="checkbox" value="{{ eos.name }}" class="eos-checkbox w-5 h-5 rounded border-gray-600 bg-slate-700 text-cyan-400 focus:ring-cyan-400">
-                        <span class="w-6 h-6 rounded border-2 border-gray-400" style="background-color: {{ eos.color }}"></span>
-                        <span class="font-medium text-gray-200">{{ eos.name }}</span>
-                    </label>
-                    {% endfor %}
-                </div>
-                
-                <!-- File Upload -->
-                <div class="mt-6 pt-4 border-t border-slate-600">
-                    <label class="flex flex-col items-center justify-center gap-3 p-4 bg-slate-700/50 hover:bg-slate-600/50 rounded-lg cursor-pointer transition-all duration-200 border-2 border-dashed border-slate-500 hover:border-cyan-400">
-                        <svg class="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path>
-                        </svg>
-                        <span class="font-medium text-cyan-300">Upload Custom EOS</span>
-                        <input type="file" id="file-upload" accept=".csv" class="hidden">
-                    </label>
-                    <p class="text-xs text-gray-500 mt-2 text-center">CSV format with columns: rho, P</p>
-                </div>
-            </div>
-            
-            <!-- Plot Selection -->
-            <div class="dark-card rounded-xl p-6 shadow-2xl">
-                <h2 class="text-xl font-semibold mb-4 text-cyan-300">Plot Type</h2>
-                <div class="space-y-3">
-                    <label class="checkbox-label flex items-center gap-3 p-4 rounded-lg cursor-pointer transition-all duration-200">
-                        <input type="radio" name="plot" value="mass-rho" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
-                        <span class="font-medium text-gray-200">Mass vs Central Density</span>
-                    </label>
-                    <label class="checkbox-label flex items-center gap-3 p-4 rounded-lg cursor-pointer transition-all duration-200">
-                        <input type="radio" name="plot" value="radius-rho" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
-                        <span class="font-medium text-gray-200">Radius vs Central Density</span>
-                    </label>
-                    <label class="checkbox-label flex items-center gap-3 p-4 rounded-lg cursor-pointer transition-all duration-200">
-                        <input type="radio" name="plot" value="mass-radius" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400" checked>
-                        <span class="font-medium text-gray-200">Mass vs Radius</span>
-                    </label>
-                    <label class="checkbox-label flex items-center gap-3 p-4 rounded-lg cursor-pointer transition-all duration-200">
-                        <input type="radio" name="plot" value="inertia" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
-                        <span class="font-medium text-gray-200">Moment of Inertia</span>
-                    </label>
-                </div>
-            </div>
-            
-            <!-- Statistics -->
-            <div class="dark-card rounded-xl p-6 shadow-2xl">
-                <h2 class="text-xl font-semibold mb-4 text-cyan-300">Statistics</h2>
-                <div id="stats-container" class="space-y-3 max-h-96 overflow-y-auto scrollbar-custom pr-2">
-                    <div class="text-center py-8">
-                        <svg class="w-12 h-12 text-gray-600 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
-                        </svg>
-                        <p class="text-gray-500 text-sm">Run computation to see results</p>
-                    </div>
-                </div>
-                <button id="download-btn" class="w-full mt-6 flex items-center justify-center gap-3 p-3 bg-emerald-600 hover:bg-emerald-500 rounded-lg font-medium transition-all duration-200 hidden">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                    </svg>
-                    <span>Download CSV</span>
-                </button>
-            </div>
-        </div>
-        <!-- Compute Button -->
-        <div class="mb-8 text-center">
-            <button id="compute-btn" class="px-10 py-4 bg-gradient-to-r from-purple-600 to-cyan-600 hover:from-purple-500 hover:to-cyan-500 rounded-xl font-bold text-lg transition-all duration-300 transform hover:scale-105 shadow-lg">
-                Solve TOV Equations
-            </button>
-            <div id="loading" class="hidden mt-6">
-                <div class="inline-flex items-center gap-3 bg-slate-800/80 rounded-full px-6 py-3">
-                    <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-cyan-400"></div>
-                    <p class="text-cyan-300 font-medium">Computing neutron star properties...</p>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Plot Area -->
-        <div id="plot-container" class="dark-card rounded-xl p-4 md:p-6 border-2 border-slate-600 hidden mb-8">
-            <div id="plot" class="w-full"></div>
-        </div>
-        
-        <!-- Footer -->
-        <div class="text-center text-gray-500 text-sm mt-8 pt-6 border-t border-slate-800">
-            <p>Neutron Star Solver • TOV Equation Integration • Dark Mode</p>
-        </div>
-    </div>
-    
-    <script>
-        let currentStats = [];
-        
-        console.log('Neutron Star Solver initialized');
-        
-        document.getElementById('compute-btn').addEventListener('click', function() {
-            console.log('Compute button clicked');
-            
-            const selectedEOS = Array.from(document.querySelectorAll('.eos-checkbox:checked')).map(cb => cb.value);
-            const plotType = document.querySelector('input[name="plot"]:checked').value;
-            
-            console.log('Selected EOS:', selectedEOS);
-            console.log('Plot type:', plotType);
-            
-            if (selectedEOS.length === 0) {
-                alert('Please select at least one EOS');
-                return;
-            }
-            
-            // Show loading state
-            document.getElementById('loading').classList.remove('hidden');
-            document.getElementById('compute-btn').disabled = true;
-            document.getElementById('compute-btn').classList.add('opacity-50');
-            
-            fetch('/compute', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ eos: selectedEOS, plot_type: plotType })
-            })
-            .then(response => {
-                console.log('Response status:', response.status);
-                if (!response.ok) {
-                    return response.json().then(errorData => {
-                        throw new Error(errorData.error || 'Server error');
-                    });
-                }
-                return response.json();
-            })
-            .then(data => {
-                console.log('Computation completed successfully');
-                
-                // Update plot
-                Plotly.newPlot('plot', JSON.parse(data.plot).data, JSON.parse(data.plot).layout);
-                document.getElementById('plot-container').classList.remove('hidden');
-                
-                // Update stats
-                currentStats = data.stats;
-                const statsHtml = data.stats.map(s => {
-                    return `<div class="p-4 bg-slate-700/30 rounded-lg border border-slate-600">
-                                <div class="font-bold text-cyan-300 text-sm mb-1">${s.name}</div>
-                                <div class="text-xs text-gray-400">M<sub>max</sub>: ${s.max_mass} M<sub>☉</sub> • Radius: ${s.radius} km</div>
-                            </div>`;
-                }).join('');
-                document.getElementById('stats-container').innerHTML = statsHtml;
-                document.getElementById('download-btn').classList.remove('hidden');
-                
-                // Hide loading
-                document.getElementById('loading').classList.add('hidden');
-                document.getElementById('compute-btn').disabled = false;
-                document.getElementById('compute-btn').classList.remove('opacity-50');
-            })
-            .catch(error => {
-                console.error('Computation error:', error);
-                alert('Error: ' + error.message);
-                document.getElementById('loading').classList.add('hidden');
-                document.getElementById('compute-btn').disabled = false;
-                document.getElementById('compute-btn').classList.remove('opacity-50');
-            });
-        });
-        
-        document.getElementById('file-upload').addEventListener('change', function(e) {
-            const file = e.target.files[0];
-            if (!file) return;
-            
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            fetch('/upload', {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    const eosList = document.getElementById('eos-list');
-                    const newLabel = document.createElement('label');
-                    newLabel.className = 'checkbox-label flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all duration-200';
-                    newLabel.innerHTML = `
-                        <input type="checkbox" value="${data.name}" class="eos-checkbox w-5 h-5 rounded border-gray-600 bg-slate-700 text-cyan-400 focus:ring-cyan-400" checked>
-                        <span class="w-6 h-6 rounded border-2 border-gray-400" style="background-color: ${data.color}"></span>
-                        <span class="font-medium text-gray-200">${data.name} <span class="text-cyan-400 text-sm">(Custom)</span></span>
-                    `;
-                    eosList.appendChild(newLabel);
-                    alert('Custom EOS uploaded successfully!');
-                } else {
-                    alert('Upload Error: ' + data.error);
-                }
-            })
-            .catch(error => {
-                alert('Upload error: ' + error.message);
-            });
-        });
-        
-        document.getElementById('download-btn').addEventListener('click', function() {
-            fetch('/download', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ stats: currentStats })
-            })
-            .then(response => response.blob())
-            .then(blob => {
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'neutron_star_results.csv';
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                window.URL.revokeObjectURL(url);
-            });
-        });
-        console.log('UI initialization complete');
-    </script>
-</body>
-</html>
-'''
-
-# Save template
-os.makedirs('templates', exist_ok=True)
-with open('templates/index.html', 'w', encoding='utf-8') as f:
-    f.write(HTML_TEMPLATE)
-
-# Initialize
-print("Loading EOS data and compiling JIT functions...")
-load_eos_data()
-
-# Precompile Numba functions
-dummy_rho = np.array([1e14, 2e14, 3e14], dtype=np.float64)
-dummy_P = np.array([1e33, 2e33, 3e33], dtype=np.float64)
-_ = ns_solve_numba(1.5e14, dummy_rho, dummy_P)
-_ = solve_all_densities(np.array([1.5e14, 2e14]), dummy_rho, dummy_P)
-
-print("✓ Ready!")
-print("\n" + "="*50)
-print("Starting Flask server...")
-print("Access the app at: http://localhost:5000")
-print("="*50 + "\n")
-
+# Initialize the application
 if __name__ == '__main__':
+    print("Starting Neutron Star Solver...")
+    load_eos_data()
+    print("\nApplication ready! Starting Flask server...")
     app.run(debug=True, host='0.0.0.0', port=5000)
