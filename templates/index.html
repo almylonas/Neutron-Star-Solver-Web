@@ -103,6 +103,32 @@
                         <input type="radio" name="plot" value="eos" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
                         <span class="font-medium text-gray-200">EoS: Pressure vs Density</span>
                     </label>
+                    <label class="checkbox-label flex items-center gap-3 p-4 rounded-lg cursor-pointer transition-all duration-200">
+                        <input type="radio" name="plot" value="density-profile" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
+                        <span class="font-medium text-gray-200">Density Profile</span>
+                    </label>
+                </div>
+
+                <!-- Mass input panel: shown only for density-profile -->
+                <div id="mass-input-panel" class="hidden mt-4 p-4 rounded-lg bg-slate-800/60 border border-slate-600">
+                    <label class="block text-sm font-semibold text-cyan-300 mb-2">
+                        Neutron Star Mass (M☉)
+                    </label>
+                    <div class="flex items-center gap-3">
+                        <input
+                            type="number"
+                            id="target-mass"
+                            value="1.4"
+                            min="0.5"
+                            max="3.0"
+                            step="0.01"
+                            class="flex-1 px-3 py-2 rounded-lg bg-slate-700 border border-slate-500 text-gray-100 focus:outline-none focus:border-cyan-400 text-sm"
+                        >
+                        <span class="text-gray-400 text-sm whitespace-nowrap">M☉</span>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-2">
+                        Typical range: 1.0 – 2.5 M☉. Must not exceed the EOS maximum mass.
+                    </p>
                 </div>
             </div>
             
@@ -161,11 +187,17 @@
         
         console.log('Neutron Star Solver initialized');
         
-        // Update plot info when plot type changes
+        // Show/hide mass input panel when density-profile is selected
         document.querySelectorAll('input[name="plot"]').forEach(radio => {
             radio.addEventListener('change', function() {
                 currentPlotType = this.value;
                 updatePlotInfo();
+                const panel = document.getElementById('mass-input-panel');
+                if (this.value === 'density-profile') {
+                    panel.classList.remove('hidden');
+                } else {
+                    panel.classList.add('hidden');
+                }
             });
         });
         
@@ -176,7 +208,8 @@
                 'radius-rho': 'Radius vs Central Density: Shows how neutron star radius depends on central density',
                 'mass-radius': 'Mass vs Radius: The fundamental mass-radius relation for neutron stars',
                 'inertia': 'Moment of Inertia: Shows how rotational inertia depends on mass',
-                'eos': 'Equation of State: Raw pressure-density relation (logarithmic axes)'
+                'eos': 'Equation of State: Raw pressure-density relation (logarithmic axes)',
+                'density-profile': 'Density Profile: Density as a function of distance from the star centre for a chosen mass'
             };
             plotInfo.textContent = plotTypes[currentPlotType] || 'Select a plot type';
         }
@@ -197,6 +230,70 @@
             if (selectedEOS.length === 0) {
                 alert('Please select at least one EOS');
                 return;
+            }
+
+            if (plotType === 'density-profile') {
+                const massVal = parseFloat(document.getElementById('target-mass').value);
+                if (isNaN(massVal) || massVal <= 0) {
+                    alert('Please enter a valid neutron star mass.');
+                    return;
+                }
+
+                document.getElementById('loading').classList.remove('hidden');
+                document.getElementById('compute-btn').disabled = true;
+                document.getElementById('compute-btn').classList.add('opacity-50');
+                document.getElementById('download-btn').classList.add('hidden');
+
+                fetch('/density_profile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ eos: selectedEOS, mass: massVal })
+                })
+                .then(response => {
+                    if (!response.ok) return response.json().then(e => { throw new Error(e.error || 'Server error'); });
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Density profile computed');
+                    currentResults = data.profiles || [];
+
+                    if (data.plot) {
+                        const plotData = JSON.parse(data.plot);
+                        Plotly.newPlot('plot', plotData.data, plotData.layout, {responsive: true});
+                        document.getElementById('plot-container').classList.remove('hidden');
+                    }
+
+                    // Show errors for EOS that exceeded max mass
+                    const errors = currentResults.filter(p => p.error);
+                    if (errors.length > 0) {
+                        const msgs = errors.map(p => `${p.name}: ${p.error}`).join('\n');
+                        alert('Some EOS could not be computed:\n' + msgs);
+                    }
+
+                    document.getElementById('loading').classList.add('hidden');
+                    document.getElementById('compute-btn').disabled = false;
+                    document.getElementById('compute-btn').classList.remove('opacity-50');
+
+                    // Update info panel
+                    const plotInfo = document.getElementById('plot-info');
+                    const ok = currentResults.filter(p => !p.error);
+                    if (ok.length > 0) {
+                        plotInfo.innerHTML = ok.map(p =>
+                            `<div class="mb-1"><span class="text-cyan-300 font-semibold">${p.name}</span>: 
+                            R = ${p.R_km.toFixed(2)} km, M = ${p.M_solar.toFixed(3)} M☉, 
+                            ρ<sub>c</sub> = ${p.rho_c.toExponential(2)} g/cm³</div>`
+                        ).join('');
+                    }
+                })
+                .catch(error => {
+                    console.error('Density profile error:', error);
+                    alert('Error: ' + error.message);
+                    document.getElementById('loading').classList.add('hidden');
+                    document.getElementById('compute-btn').disabled = false;
+                    document.getElementById('compute-btn').classList.remove('opacity-50');
+                });
+
+                return; // don't fall through to the normal compute path
             }
             
             // Show loading state
@@ -268,7 +365,8 @@
                 'radius-rho': 'Radius vs Central Density',
                 'mass-radius': 'Mass vs Radius',
                 'inertia': 'Moment of Inertia',
-                'eos': 'Equation of State (Pressure vs Density)'
+                'eos': 'Equation of State (Pressure vs Density)',
+                'density-profile': 'Density Profile'
             };
             return descriptions[plotType] || plotType;
         }
