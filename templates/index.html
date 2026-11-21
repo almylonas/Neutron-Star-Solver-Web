@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Neutron Star Solver</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { 
@@ -104,31 +104,27 @@
                         <span class="font-medium text-gray-200">EoS: Pressure vs Density</span>
                     </label>
                     <label class="checkbox-label flex items-center gap-3 p-4 rounded-lg cursor-pointer transition-all duration-200">
-                        <input type="radio" name="plot" value="density-profile" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
-                        <span class="font-medium text-gray-200">Density Profile</span>
+                        <input type="radio" name="plot" value="profile" class="w-5 h-5 text-cyan-400 focus:ring-cyan-400">
+                        <span class="font-medium text-gray-200">Density Profile ρ(r)</span>
                     </label>
                 </div>
 
-                <!-- Mass input panel: shown only for density-profile -->
-                <div id="mass-input-panel" class="hidden mt-4 p-4 rounded-lg bg-slate-800/60 border border-slate-600">
-                    <label class="block text-sm font-semibold text-cyan-300 mb-2">
-                        Neutron Star Mass (M☉)
-                    </label>
-                    <div class="flex items-center gap-3">
-                        <input
-                            type="number"
-                            id="target-mass"
-                            value="1.4"
-                            min="0.5"
-                            max="3.0"
-                            step="0.01"
-                            class="flex-1 px-3 py-2 rounded-lg bg-slate-700 border border-slate-500 text-gray-100 focus:outline-none focus:border-cyan-400 text-sm"
-                        >
-                        <span class="text-gray-400 text-sm whitespace-nowrap">M☉</span>
+                <!-- Density-profile options (shown only for the profile plot) -->
+                <div id="profile-options" class="hidden mt-4 p-4 rounded-lg bg-slate-900/60 border border-slate-600 space-y-3">
+                    <div class="text-sm font-semibold text-cyan-300">Star to profile</div>
+                    <div class="flex gap-2">
+                        <select id="profile-mode" class="flex-1 min-w-0 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-cyan-400 focus:outline-none">
+                            <option value="mass">Mass (M☉)</option>
+                            <option value="rho_c">Central density ρc (g/cm³)</option>
+                        </select>
+                        <input id="profile-value" type="text" inputmode="decimal" value="1.4"
+                               class="w-24 shrink-0 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-cyan-400 focus:outline-none">
                     </div>
-                    <p class="text-xs text-gray-500 mt-2">
-                        Typical range: 1.0 – 2.5 M☉. Must not exceed the EOS maximum mass.
-                    </p>
+                    <label class="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                        <input id="profile-log" type="checkbox" class="w-4 h-4 rounded border-gray-600 bg-slate-700 text-cyan-400 focus:ring-cyan-400">
+                        Logarithmic ρ axis (shows the crust)
+                    </label>
+                    <p id="profile-hint" class="text-xs text-gray-500">Finds ρc on the stable branch giving this mass, for each selected EOS.</p>
                 </div>
             </div>
             
@@ -166,6 +162,7 @@
                     <div id="plot-info" class="text-xs text-gray-400">
                         Select EOS and plot type, then click Compute
                     </div>
+                    <div id="warnings" class="hidden mt-3 text-xs text-amber-300 space-y-1"></div>
                 </div>
             </div>
         </div>
@@ -183,246 +180,194 @@
     
     <script>
         let currentResults = [];
-        let currentPlotType = 'mass-radius';
-        
-        console.log('Neutron Star Solver initialized');
-        
-        // Show/hide mass input panel when density-profile is selected
+        let currentPlotType = 'mass-radius';   // selected radio
+        let computedPlotType = null;           // plot type of the data currently shown
+
+        const PLOT_INFO = {
+            'mass-rho': 'Mass vs Central Density: Shows how neutron star mass depends on central density',
+            'radius-rho': 'Radius vs Central Density: Shows how neutron star radius depends on central density',
+            'mass-radius': 'Mass vs Radius: The fundamental mass-radius relation for neutron stars',
+            'inertia': 'Moment of Inertia: Shows how rotational inertia depends on mass',
+            'eos': 'Equation of State: Raw pressure-density relation (logarithmic axes)',
+            'profile': 'Density Profile: ρ(r) from the centre to the surface of one star per EOS, chosen by mass or central density'
+        };
+        const PLOT_NAMES = {
+            'mass-rho': 'Mass vs Central Density',
+            'radius-rho': 'Radius vs Central Density',
+            'mass-radius': 'Mass vs Radius',
+            'inertia': 'Moment of Inertia',
+            'eos': 'Equation of State (Pressure vs Density)',
+            'profile': 'Density Profile ρ(r)'
+        };
+
+        const $ = id => document.getElementById(id);
+        const escapeHtml = s => String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+
+        function updatePlotInfo() {
+            $('plot-info').textContent = PLOT_INFO[currentPlotType] || 'Select a plot type';
+            $('profile-options').classList.toggle('hidden', currentPlotType !== 'profile');
+        }
+
         document.querySelectorAll('input[name="plot"]').forEach(radio => {
             radio.addEventListener('change', function() {
                 currentPlotType = this.value;
                 updatePlotInfo();
-                const panel = document.getElementById('mass-input-panel');
-                if (this.value === 'density-profile') {
-                    panel.classList.remove('hidden');
-                } else {
-                    panel.classList.add('hidden');
-                }
             });
         });
-        
-        function updatePlotInfo() {
-            const plotInfo = document.getElementById('plot-info');
-            const plotTypes = {
-                'mass-rho': 'Mass vs Central Density: Shows how neutron star mass depends on central density',
-                'radius-rho': 'Radius vs Central Density: Shows how neutron star radius depends on central density',
-                'mass-radius': 'Mass vs Radius: The fundamental mass-radius relation for neutron stars',
-                'inertia': 'Moment of Inertia: Shows how rotational inertia depends on mass',
-                'eos': 'Equation of State: Raw pressure-density relation (logarithmic axes)',
-                'density-profile': 'Density Profile: Density as a function of distance from the star centre for a chosen mass'
-            };
-            plotInfo.textContent = plotTypes[currentPlotType] || 'Select a plot type';
-        }
-        
-        // Initialize plot info
+
+        // Profile controls
+        $('profile-mode').addEventListener('change', function() {
+            if (this.value === 'mass') {
+                $('profile-value').value = '1.4';
+                $('profile-hint').textContent = 'Finds ρc on the stable branch giving this mass, for each selected EOS.';
+            } else {
+                $('profile-value').value = '1e15';
+                $('profile-hint').textContent = 'Uses this central density for every selected EOS (e.g. 1e15).';
+            }
+        });
+        // Toggling the log axis only restyles the existing plot - no recompute
+        $('profile-log').addEventListener('change', function() {
+            if (computedPlotType === 'profile' && currentResults.length > 0) {
+                const RHO_SAT = 2.7e14;   // annotation y is in log10 units on a log axis
+                Plotly.relayout('plot', {
+                    'yaxis.type': this.checked ? 'log' : 'linear',
+                    'annotations[0].y': this.checked ? Math.log10(RHO_SAT) : RHO_SAT
+                });
+            }
+        });
+        $('profile-value').addEventListener('keydown', e => { if (e.key === 'Enter') $('compute-btn').click(); });
+
         updatePlotInfo();
-        
-        document.getElementById('compute-btn').addEventListener('click', function() {
-            console.log('Compute button clicked');
-            
+
+        function setLoading(on) {
+            $('loading').classList.toggle('hidden', !on);
+            $('compute-btn').disabled = on;
+            $('compute-btn').classList.toggle('opacity-50', on);
+            if (on) $('download-btn').classList.add('hidden');
+        }
+
+        function showWarnings(list) {
+            const box = $('warnings');
+            if (!list || list.length === 0) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+            box.innerHTML = list.map(w => `<div>⚠ ${escapeHtml(w)}</div>`).join('');
+            box.classList.remove('hidden');
+        }
+
+        $('compute-btn').addEventListener('click', function() {
             const selectedEOS = Array.from(document.querySelectorAll('.eos-checkbox:checked')).map(cb => cb.value);
             const plotType = document.querySelector('input[name="plot"]:checked').value;
             currentPlotType = plotType;
-            
-            console.log('Selected EOS:', selectedEOS);
-            console.log('Plot type:', plotType);
-            
+
             if (selectedEOS.length === 0) {
                 alert('Please select at least one EOS');
                 return;
             }
 
-            if (plotType === 'density-profile') {
-                const massVal = parseFloat(document.getElementById('target-mass').value);
-                if (isNaN(massVal) || massVal <= 0) {
-                    alert('Please enter a valid neutron star mass.');
+            const payload = { eos: selectedEOS, plot_type: plotType };
+            if (plotType === 'profile') {
+                const value = parseFloat($('profile-value').value);
+                if (!isFinite(value) || value <= 0) {
+                    alert('Enter a positive mass (M☉) or central density (g/cm³)');
                     return;
                 }
-
-                document.getElementById('loading').classList.remove('hidden');
-                document.getElementById('compute-btn').disabled = true;
-                document.getElementById('compute-btn').classList.add('opacity-50');
-                document.getElementById('download-btn').classList.add('hidden');
-
-                fetch('/density_profile', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ eos: selectedEOS, mass: massVal })
-                })
-                .then(response => {
-                    if (!response.ok) return response.json().then(e => { throw new Error(e.error || 'Server error'); });
-                    return response.json();
-                })
-                .then(data => {
-                    console.log('Density profile computed');
-                    currentResults = data.profiles || [];
-
-                    if (data.plot) {
-                        const plotData = JSON.parse(data.plot);
-                        Plotly.newPlot('plot', plotData.data, plotData.layout, {responsive: true});
-                        document.getElementById('plot-container').classList.remove('hidden');
-                    }
-
-                    // Show errors for EOS that exceeded max mass
-                    const errors = currentResults.filter(p => p.error);
-                    if (errors.length > 0) {
-                        const msgs = errors.map(p => `${p.name}: ${p.error}`).join('\n');
-                        alert('Some EOS could not be computed:\n' + msgs);
-                    }
-
-                    document.getElementById('loading').classList.add('hidden');
-                    document.getElementById('compute-btn').disabled = false;
-                    document.getElementById('compute-btn').classList.remove('opacity-50');
-
-                    // Update info panel
-                    const plotInfo = document.getElementById('plot-info');
-                    const ok = currentResults.filter(p => !p.error);
-                    if (ok.length > 0) {
-                        plotInfo.innerHTML = ok.map(p =>
-                            `<div class="mb-1"><span class="text-cyan-300 font-semibold">${p.name}</span>: 
-                            R = ${p.R_km.toFixed(2)} km, M = ${p.M_solar.toFixed(3)} M☉, 
-                            ρ<sub>c</sub> = ${p.rho_c.toExponential(2)} g/cm³</div>`
-                        ).join('');
-                    }
-                })
-                .catch(error => {
-                    console.error('Density profile error:', error);
-                    alert('Error: ' + error.message);
-                    document.getElementById('loading').classList.add('hidden');
-                    document.getElementById('compute-btn').disabled = false;
-                    document.getElementById('compute-btn').classList.remove('opacity-50');
-                });
-
-                return; // don't fall through to the normal compute path
+                payload.profile = { mode: $('profile-mode').value, value: value, log_scale: $('profile-log').checked };
             }
-            
-            // Show loading state
-            document.getElementById('loading').classList.remove('hidden');
-            document.getElementById('compute-btn').disabled = true;
-            document.getElementById('compute-btn').classList.add('opacity-50');
-            document.getElementById('download-btn').classList.add('hidden');
-            
+
+            setLoading(true);
             fetch('/compute', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ eos: selectedEOS, plot_type: plotType })
+                body: JSON.stringify(payload)
             })
-            .then(response => {
-                console.log('Response status:', response.status);
-                if (!response.ok) {
-                    return response.json().then(errorData => {
-                        throw new Error(errorData.error || 'Server error');
-                    });
-                }
-                return response.json();
-            })
+            .then(response => response.json().then(body => {
+                if (!response.ok) throw new Error(body.error || 'Server error');
+                return body;
+            }))
             .then(data => {
-                console.log('Computation completed successfully');
                 currentResults = data.results || [];
-                
-                // Update plot
+                computedPlotType = plotType;
                 if (data.plot) {
-                    const plotData = JSON.parse(data.plot);
-                    Plotly.newPlot('plot', plotData.data, plotData.layout, {responsive: true});
-                    document.getElementById('plot-container').classList.remove('hidden');
+                    const fig = typeof data.plot === 'string' ? JSON.parse(data.plot) : data.plot;
+                    $('plot-container').classList.remove('hidden');
+                    Plotly.react('plot', fig.data, fig.layout, {responsive: true});
                 }
-                
-                // Show download button
-                document.getElementById('download-btn').classList.remove('hidden');
-                
-                // Hide loading
-                document.getElementById('loading').classList.add('hidden');
-                document.getElementById('compute-btn').disabled = false;
-                document.getElementById('compute-btn').classList.remove('opacity-50');
-                
-                // Update plot info with results
+                if (currentResults.length > 0) $('download-btn').classList.remove('hidden');
                 updateResultsInfo();
+                showWarnings(data.warnings);
             })
             .catch(error => {
                 console.error('Computation error:', error);
                 alert('Error: ' + error.message);
-                document.getElementById('loading').classList.add('hidden');
-                document.getElementById('compute-btn').disabled = false;
-                document.getElementById('compute-btn').classList.remove('opacity-50');
-            });
+            })
+            .finally(() => setLoading(false));
         });
-        
+
         function updateResultsInfo() {
-            const plotInfo = document.getElementById('plot-info');
-            if (currentResults.length > 0) {
-                const eosNames = currentResults.map(r => r.name).join(', ');
-                plotInfo.innerHTML = `
-                    <div class="text-cyan-300 font-semibold">${currentResults.length} EOS computed</div>
-                    <div class="mt-1">${eosNames}</div>
-                    <div class="mt-2 text-gray-300">Plot: ${getPlotTypeDescription(currentPlotType)}</div>
-                `;
+            const plotInfo = $('plot-info');
+            if (currentResults.length === 0) {
+                plotInfo.textContent = 'No results for this selection';
+                return;
             }
+            let html = `<div class="text-cyan-300 font-semibold">${currentResults.length} EOS computed</div>
+                        <div class="mt-2 text-gray-300">Plot: ${PLOT_NAMES[computedPlotType] || computedPlotType}</div>`;
+            if (computedPlotType === 'profile') {
+                html += `<table class="mt-2 w-full text-left">
+                    <tr class="text-gray-500"><th class="font-normal">EOS</th><th class="font-normal">ρc (g/cm³)</th><th class="font-normal">M (M☉)</th><th class="font-normal">R (km)</th></tr>` +
+                    currentResults.map(r => `<tr><td>${escapeHtml(r.name)}</td><td>${r.profile.rho_c.toExponential(3)}</td><td>${r.profile.M.toFixed(3)}</td><td>${r.profile.R.toFixed(2)}</td></tr>`).join('') +
+                    `</table>`;
+            } else {
+                html += `<div class="mt-1">${currentResults.map(r => escapeHtml(r.name)).join(', ')}</div>`;
+            }
+            plotInfo.innerHTML = html;
         }
-        
-        function getPlotTypeDescription(plotType) {
-            const descriptions = {
-                'mass-rho': 'Mass vs Central Density',
-                'radius-rho': 'Radius vs Central Density',
-                'mass-radius': 'Mass vs Radius',
-                'inertia': 'Moment of Inertia',
-                'eos': 'Equation of State (Pressure vs Density)',
-                'density-profile': 'Density Profile'
-            };
-            return descriptions[plotType] || plotType;
-        }
-        
-        document.getElementById('file-upload').addEventListener('change', function(e) {
+
+        $('file-upload').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (!file) return;
-            
             const formData = new FormData();
             formData.append('file', file);
-            
-            fetch('/upload', {
-                method: 'POST',
-                body: formData
-            })
+
+            fetch('/upload', { method: 'POST', body: formData })
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
-                    const eosList = document.getElementById('eos-list');
-                    const newLabel = document.createElement('label');
-                    newLabel.className = 'checkbox-label flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all duration-200';
-                    newLabel.innerHTML = `
-                        <input type="checkbox" value="${data.name}" class="eos-checkbox w-5 h-5 rounded border-gray-600 bg-slate-700 text-cyan-400 focus:ring-cyan-400" checked>
-                        <span class="w-6 h-6 rounded border-2 border-gray-400" style="background-color: ${data.color}"></span>
-                        <span class="font-medium text-gray-200">${data.name} <span class="text-cyan-400 text-sm">(Custom)</span></span>
-                    `;
-                    eosList.appendChild(newLabel);
+                    const existing = document.querySelector(`.eos-checkbox[value="${CSS.escape(data.name)}"]`);
+                    if (existing) {
+                        existing.checked = true;      // re-upload replaces the data, keep one entry
+                    } else {
+                        const newLabel = document.createElement('label');
+                        newLabel.className = 'checkbox-label flex items-center gap-3 p-3 rounded-lg cursor-pointer transition-all duration-200';
+                        newLabel.innerHTML = `
+                            <input type="checkbox" value="${escapeHtml(data.name)}" class="eos-checkbox w-5 h-5 rounded border-gray-600 bg-slate-700 text-cyan-400 focus:ring-cyan-400" checked>
+                            <span class="w-6 h-6 rounded border-2 border-gray-400" style="background-color: ${data.color}"></span>
+                            <span class="font-medium text-gray-200">${escapeHtml(data.name)} <span class="text-cyan-400 text-sm">(Custom)</span></span>
+                        `;
+                        $('eos-list').appendChild(newLabel);
+                    }
                     alert('Custom EOS uploaded successfully!');
                 } else {
                     alert('Upload Error: ' + data.error);
                 }
             })
-            .catch(error => {
-                alert('Upload error: ' + error.message);
-            });
+            .catch(error => alert('Upload error: ' + error.message))
+            .finally(() => { e.target.value = ''; });
         });
-        
-        document.getElementById('download-btn').addEventListener('click', function() {
-            if (currentResults.length === 0) {
+
+        $('download-btn').addEventListener('click', function() {
+            if (currentResults.length === 0 || !computedPlotType) {
                 alert('No data available for download. Please compute first.');
                 return;
             }
-            
+            // Download the data of the plot that is shown, even if another radio is now selected
+            const plotType = computedPlotType;
             fetch('/download_csv', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ 
-                    results: currentResults,
-                    plot_type: currentPlotType
-                })
+                body: JSON.stringify({ results: currentResults, plot_type: plotType })
             })
             .then(response => {
                 if (!response.ok) {
-                    return response.json().then(errorData => {
-                        throw new Error(errorData.error || 'Download error');
-                    });
+                    return response.json().then(errorData => { throw new Error(errorData.error || 'Download error'); });
                 }
                 return response.blob();
             })
@@ -430,7 +375,7 @@
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `neutron_star_${currentPlotType}_data.csv`;
+                a.download = `neutron_star_${plotType}_data.csv`;
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
@@ -441,18 +386,12 @@
                 alert('Download error: ' + error.message);
             });
         });
-        
-        // Add some sample EOS selection for demo
-        document.addEventListener('DOMContentLoaded', function() {
-            // Auto-select a few EOS for demo
-            const demoEOS = ['APR3', 'DD2', 'BSK20'];
-            demoEOS.forEach(eosName => {
-                const checkbox = document.querySelector(`.eos-checkbox[value="${eosName}"]`);
-                if (checkbox) checkbox.checked = true;
-            });
+
+        // Pre-select a few EOS for demo
+        ['APR3', 'DD2', 'BSK20'].forEach(eosName => {
+            const checkbox = document.querySelector(`.eos-checkbox[value="${eosName}"]`);
+            if (checkbox) checkbox.checked = true;
         });
-        
-        console.log('UI initialization complete');
     </script>
 </body>
 </html>
