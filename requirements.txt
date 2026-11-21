@@ -2,7 +2,6 @@ flask>=3.0.0
 numpy>=1.25.2,<2.0
 pandas>=2.0.3
 numba>=0.60.0
-plotly>=5.18.0
 scipy>=1.10.0,<2.0
 werkzeug>=3.0.0
 gunicorn>=21.2.0
