@@ -20,5 +20,11 @@ RUN pip install -r requirements.txt
 # Copy the rest of your app
 COPY . .
 
-# Run your app
-CMD ["python", "main.py"]
+# Compile the Numba kernels once at build time (cached in __pycache__),
+# so the container starts serving immediately
+RUN python -c "import main"
+
+# Production server. One worker keeps a single shared result cache;
+# threads handle concurrent requests (the solver itself is serialised).
+ENV PORT=5000
+CMD gunicorn -w 1 --threads 4 -b 0.0.0.0:${PORT} main:app
