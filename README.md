@@ -60,6 +60,13 @@ Each CSV file must include at least these columns:
     ```
     Set `FLASK_DEBUG=1` to run `python main.py` with the Flask debugger.
 
+5. **Vercel**
+    No configuration needed: Vercel detects the Flask `app` in `main.py`, installs
+    `requirements.txt` and uses Python 3.12 (from `.python-version`). Push the repo or run
+    `vercel deploy`. The code folder is read-only on Vercel, so the Numba compile cache is
+    written to `/tmp`; the first request on a fresh instance takes a few seconds while the
+    solver compiles.
+
 ---
 
 ## Density profile ρ(r)
