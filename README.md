@@ -9,12 +9,13 @@ It supports both **built-in EOS datasets** and **custom user-uploaded EOS files*
 
 ## Features
 
-- Numerical integration of the TOV equations using Numba-accelerated solvers.  
+- Numerical integration of the TOV equations with an adaptive Dormand–Prince 5(4) integrator compiled with Numba (results cached per EOS).  
 - Interactive Plotly visualizations:
   - Mass–Radius (M–R) curves  
   - Radius vs. Central Density  
   - Mass vs. Central Density  
   - Moment of Inertia  
+  - Density profile ρ(r) of a single star, chosen by mass (M☉) or central density (g/cm³)  
 - Upload custom EOS `.csv` files with `rho` and `P` columns.
 - Export results as `.csv`.
 - Dark mode UI with TailwindCSS.
@@ -50,3 +51,26 @@ Each CSV file must include at least these columns:
     ```bash
    python main.py
    ```
+
+4. **Production / Docker**
+    ```bash
+    gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 main:app
+    # or
+    docker build -t ns-solver . && docker run -p 5000:5000 ns-solver
+    ```
+    Set `FLASK_DEBUG=1` to run `python main.py` with the Flask debugger.
+
+---
+
+## Density profile ρ(r)
+
+Choose **Density Profile ρ(r)**, then either
+
+- **Mass (M☉)**: for every selected EOS, the central density ρc giving that mass on the
+  stable branch (ρc below the maximum-mass configuration) is found by root-finding, or
+- **Central density ρc (g/cm³)**: the same ρc is used for every selected EOS.
+
+The plot shows ρ(r) from the centre to the surface (P = 10⁻¹⁰ P_c), with an optional
+logarithmic axis to resolve the crust, and a reference line at nuclear saturation density.
+The CSV export contains r (km), ρ (g/cm³), enclosed mass m(r) (M☉) and P (dyn/cm²).
+
