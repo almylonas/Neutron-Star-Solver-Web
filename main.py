@@ -1,37 +1,54 @@
 """
 Neutron Star Solver Flask Web Application
-Run with: python app.py
+Run with: python main.py          (development server)
+      or: gunicorn -w 1 --threads 4 -b 0.0.0.0:5000 main:app
 Access at: http://localhost:5000
 """
 
-from flask import Flask, render_template, request, jsonify, send_file
+import io
+import json
+import os
+import threading
+
 import numpy as np
 import pandas as pd
-from numba import jit, prange
-import plotly.graph_objects as go
-import plotly.utils
-import json
-import io
-import os
-from werkzeug.utils import secure_filename
+from flask import Flask, render_template, request, jsonify, send_file
+from numba import njit, prange
 from scipy.optimize import brentq
+from werkzeug.utils import secure_filename
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EOS_DIR = os.path.join(BASE_DIR, 'eos')
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-# Ensure upload folder exists
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-# Constants
+# ---------------------------------------------------------------------------
+# Constants (CGS)
+# ---------------------------------------------------------------------------
 G = 6.67e-8
 c = 3e10
 c2 = c * c
 TWO_G_C2 = 2 * G / c2
 FOUR_PI = 4.0 * np.pi
-P_SURF = 1e20  # Surface pressure threshold (dyn/cm²)
+M_SUN = 2e33            # g (value used throughout the original app)
+RHO_SAT = 2.7e14        # nuclear saturation density, g/cm³ (reference line on ρ(r) plots)
 
-# EOS Configuration
+# Solver settings
+R_START = 100.0         # cm, inner boundary (m and P from the central Taylor expansion)
+P_STOP_FRAC = 1e-10     # surface defined as P = 1e-10 · P_c (same criterion as before)
+RTOL = 1e-8             # relative error tolerance of the adaptive integrator
+H_MAX = 2e4             # cm, largest allowed step (200 m)
+MAX_STEPS = 200000
+PROFILE_MAX_POINTS = 20000
+
+# Grid of central densities used for the M–R / M–ρc / R–ρc curves
+RHO_C_GRID = np.concatenate([
+    np.arange(2.5e14, 1e15, 0.5e13),
+    np.arange(1e15, 4e15, 0.5e14)
+])
+
+# EOS Configuration: (name, file, sampling, colour)
 EOS_CONFIG = [
     ("BSK20", "bsk20.csv", 6, "#D7009A"),
     ("DD2", "dd2.csv", 4, "#16A1BD"),
@@ -53,1012 +70,662 @@ EOS_CONFIG = [
     ("ALF2", "alf2.csv", 1, "#7FFF00")
 ]
 
-# Load EOS data
-eos_cache = {}
+eos_cache = {}          # name -> {'rho', 'P', 'color'}
+_curve_cache = {}       # name -> computed M(ρc), R(ρc) curve
+_profile_cache = {}     # (name, mode, value) -> (profile, warnings)
+PROFILE_CACHE_SIZE = 256
+_cache_lock = threading.Lock()
+# Numba's default (workqueue) threading layer must not be entered from two
+# threads at once, and the Flask/gunicorn servers are threaded -> serialise.
+_solver_lock = threading.Lock()
+
+
+def _clean_eos(rho, P):
+    """Drop invalid rows and sort by density so the binary searches are valid."""
+    rho = np.asarray(rho, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    ok = np.isfinite(rho) & np.isfinite(P) & (rho > 0) & (P > 0)
+    rho, P = rho[ok], P[ok]
+    order = np.argsort(rho, kind='stable')
+    rho, P = rho[order], P[order]
+    if len(rho) < 2:
+        raise ValueError("EOS needs at least two valid (rho, P) rows")
+    if np.any(np.diff(P) < 0):
+        raise ValueError("Pressure must not decrease with density")
+    return np.ascontiguousarray(rho), np.ascontiguousarray(P)
+
 
 def load_eos_data():
     """Load all predefined EOS data"""
     columns = ["a", "b", "rho", "P"]
     loaded_count = 0
-    
-    # Check if eos directory exists
-    if not os.path.exists('./eos'):
-        print("ERROR: './eos' directory not found!")
-        print("Please create an 'eos' folder in the same directory as this script")
+
+    if not os.path.isdir(EOS_DIR):
+        print(f"ERROR: EOS directory not found: {EOS_DIR}")
         return
-    
-    print("\nLoading EOS files from: ./eos/")
-    
+
+    print(f"\nLoading EOS files from: {EOS_DIR}")
     for name, filename, sampling, color in EOS_CONFIG:
-        filepath = f"./eos/{filename}"
+        filepath = os.path.join(EOS_DIR, filename)
         try:
             if not os.path.exists(filepath):
                 print(f"  ✗ {filename} - FILE NOT FOUND")
                 continue
-                
             df = pd.read_csv(filepath, usecols=columns)
             if sampling > 1:
                 df = df[1::sampling]
-            
-            eos_cache[name] = {
-                'rho': df.rho.values.astype(np.float64),
-                'P': df.P.values.astype(np.float64),
-                'color': color
-            }
+            rho, P = _clean_eos(df.rho.values, df.P.values)
+            eos_cache[name] = {'rho': rho, 'P': P, 'color': color}
             loaded_count += 1
-            print(f"  ✓ {filename} - Loaded successfully ({len(df)} points)")
+            print(f"  ✓ {filename} - Loaded successfully ({len(rho)} points)")
         except Exception as e:
             print(f"  ✗ {filename} - Error: {e}")
-    
+
     print(f"\nTotal EOS loaded: {loaded_count}/{len(EOS_CONFIG)}")
-    
     if loaded_count == 0:
         print("\nWARNING: No EOS files were loaded!")
-        print("The app will run but computations will fail.")
-        print("Please ensure your EOS CSV files are in the './eos/' directory.")
 
-# Numba-compiled functions
-@jit(nopython=True, fastmath=True)
-def interp_P(rho_val, rho_arr, P_arr):
-    """Fast linear interpolation for P(rho)"""
-    if rho_val <= rho_arr[0]:
-        return P_arr[0]
-    if rho_val >= rho_arr[-1]:
-        return P_arr[-1]
-    
-    left, right = 0, len(rho_arr) - 1
-    while right - left > 1:
-        mid = (left + right) // 2
-        if rho_arr[mid] <= rho_val:
-            left = mid
+
+# ---------------------------------------------------------------------------
+# Numba kernels
+# ---------------------------------------------------------------------------
+@njit(fastmath=True, cache=True)
+def interp_lin(x, xs, ys):
+    """Linear interpolation y(x) on a sorted table (clamped at the ends)."""
+    n = xs.shape[0]
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[n - 1]:
+        return ys[n - 1]
+    lo, hi = 0, n - 1
+    while hi - lo > 1:
+        mid = (lo + hi) >> 1
+        if xs[mid] <= x:
+            lo = mid
         else:
-            right = mid
-    
-    t = (rho_val - rho_arr[left]) / (rho_arr[right] - rho_arr[left])
-    return P_arr[left] + t * (P_arr[right] - P_arr[left])
+            hi = mid
+    t = (x - xs[lo]) / (xs[hi] - xs[lo])
+    return ys[lo] + t * (ys[hi] - ys[lo])
 
-@jit(nopython=True, fastmath=True)
-def interp_rho(P_val, rho_arr, P_arr):
-    """Fast linear interpolation for rho(P)"""
-    if P_val <= P_arr[0]:
-        return rho_arr[0]
-    if P_val >= P_arr[-1]:
-        return rho_arr[-1]
-    
-    left, right = 0, len(P_arr) - 1
-    while right - left > 1:
-        mid = (left + right) // 2
-        if P_arr[mid] <= P_val:
-            left = mid
+
+@njit(fastmath=True, cache=True, inline='always')
+def tov_rhs(r, m, P, rho_t, P_t):
+    """TOV right-hand side: returns (dm/dr, dP/dr)."""
+    if P < 0.0:
+        P = 0.0
+    rho = interp_lin(P, P_t, rho_t)
+    dm = FOUR_PI * r * r * rho
+    dP = -G * (rho + P / c2) * (m + FOUR_PI * r * r * r * P / c2) / (
+        r * r * (1.0 - TWO_G_C2 * m / r))
+    return dm, dP
+
+
+# Dormand–Prince 5(4) tableau
+_A21 = 1.0 / 5.0
+_A31, _A32 = 3.0 / 40.0, 9.0 / 40.0
+_A41, _A42, _A43 = 44.0 / 45.0, -56.0 / 15.0, 32.0 / 9.0
+_A51, _A52, _A53, _A54 = 19372.0 / 6561.0, -25360.0 / 2187.0, 64448.0 / 6561.0, -212.0 / 729.0
+_A61, _A62, _A63, _A64, _A65 = (9017.0 / 3168.0, -355.0 / 33.0, 46732.0 / 5247.0,
+                                49.0 / 176.0, -5103.0 / 18656.0)
+_B1, _B3, _B4, _B5, _B6 = 35.0 / 384.0, 500.0 / 1113.0, 125.0 / 192.0, -2187.0 / 6784.0, 11.0 / 84.0
+_E1, _E3, _E4, _E5, _E6, _E7 = (71.0 / 57600.0, -71.0 / 16695.0, 71.0 / 1920.0,
+                                -17253.0 / 339200.0, 22.0 / 525.0, -1.0 / 40.0)
+
+
+@njit(fastmath=True, cache=True)
+def tov_integrate(rho_c, rho_t, P_t, rec_r, rec_m, rec_P, rec_rho):
+    """
+    Integrate the TOV equations outward from the centre with an adaptive
+    Dormand–Prince 5(4) scheme until P = P_STOP_FRAC · P_c.
+
+    If the rec_* arrays have non-zero length, every accepted step is stored
+    (r [cm], m [g], P [dyn/cm²], ρ [g/cm³]) - this is the radial profile.
+
+    Returns (R [cm], M [g], number of recorded points).
+    """
+    Pc = interp_lin(rho_c, rho_t, P_t)
+    P_stop = P_STOP_FRAC * Pc
+    r = R_START
+    m = FOUR_PI / 3.0 * r * r * r * rho_c
+    P = Pc
+    h = R_START
+
+    n_cap = rec_r.shape[0]
+    n_rec = 0
+    if n_cap > 0:
+        rec_r[0] = 0.0
+        rec_m[0] = 0.0
+        rec_P[0] = Pc
+        rec_rho[0] = rho_c
+        n_rec = 1
+
+    k1m, k1P = tov_rhs(r, m, P, rho_t, P_t)
+    for _ in range(MAX_STEPS):
+        k2m, k2P = tov_rhs(r + _A21 * h, m + h * _A21 * k1m, P + h * _A21 * k1P, rho_t, P_t)
+        k3m, k3P = tov_rhs(r + 0.3 * h,
+                           m + h * (_A31 * k1m + _A32 * k2m),
+                           P + h * (_A31 * k1P + _A32 * k2P), rho_t, P_t)
+        k4m, k4P = tov_rhs(r + 0.8 * h,
+                           m + h * (_A41 * k1m + _A42 * k2m + _A43 * k3m),
+                           P + h * (_A41 * k1P + _A42 * k2P + _A43 * k3P), rho_t, P_t)
+        k5m, k5P = tov_rhs(r + (8.0 / 9.0) * h,
+                           m + h * (_A51 * k1m + _A52 * k2m + _A53 * k3m + _A54 * k4m),
+                           P + h * (_A51 * k1P + _A52 * k2P + _A53 * k3P + _A54 * k4P), rho_t, P_t)
+        k6m, k6P = tov_rhs(r + h,
+                           m + h * (_A61 * k1m + _A62 * k2m + _A63 * k3m + _A64 * k4m + _A65 * k5m),
+                           P + h * (_A61 * k1P + _A62 * k2P + _A63 * k3P + _A64 * k4P + _A65 * k5P),
+                           rho_t, P_t)
+        m_new = m + h * (_B1 * k1m + _B3 * k3m + _B4 * k4m + _B5 * k5m + _B6 * k6m)
+        P_new = P + h * (_B1 * k1P + _B3 * k3P + _B4 * k4P + _B5 * k5P + _B6 * k6P)
+        k7m, k7P = tov_rhs(r + h, m_new, P_new, rho_t, P_t)
+
+        err_m = h * (_E1 * k1m + _E3 * k3m + _E4 * k4m + _E5 * k5m + _E6 * k6m + _E7 * k7m)
+        err_P = h * (_E1 * k1P + _E3 * k3P + _E4 * k4P + _E5 * k5P + _E6 * k6P + _E7 * k7P)
+        sc_m = RTOL * max(abs(m), abs(m_new))
+        sc_P = RTOL * max(abs(P), abs(P_new)) + 1e-300
+        err = max(abs(err_m) / sc_m, abs(err_P) / sc_P)
+
+        if err <= 1.0:
+            if P_new > P_stop:
+                # accept
+                r += h
+                m = m_new
+                P = P_new
+                k1m, k1P = k7m, k7P
+                if n_rec < n_cap:
+                    rec_r[n_rec] = r
+                    rec_m[n_rec] = m
+                    rec_P[n_rec] = P
+                    rec_rho[n_rec] = interp_lin(P, P_t, rho_t)
+                    n_rec += 1
+                fac = 5.0 if err < 1e-10 else min(5.0, 0.9 * err ** -0.2)
+                h = min(h * fac, H_MAX)
+            elif h > 1.0:
+                # step overshoots the surface: shrink until it is < 1 cm
+                h *= 0.5
+            else:
+                f = (P - P_stop) / (P - P_new)
+                R = r + f * h
+                M = m + f * (m_new - m)
+                if n_rec < n_cap:
+                    rec_r[n_rec] = R
+                    rec_m[n_rec] = M
+                    rec_P[n_rec] = P_stop
+                    rec_rho[n_rec] = interp_lin(P_stop, P_t, rho_t)
+                    n_rec += 1
+                return R, M, n_rec
         else:
-            right = mid
-    
-    t = (P_val - P_arr[left]) / (P_arr[right] - P_arr[left])
-    return rho_arr[left] + t * (rho_arr[right] - rho_arr[left])
+            h *= max(0.2, 0.9 * err ** -0.2)
+    return r, m, n_rec
 
-@jit(nopython=True, fastmath=True, inline='always')
-def compute_derivatives(r, m, P, rho):
-    """Compute TOV equation derivatives"""
-    dr_dr = 1.0
-    dm_dr = FOUR_PI * r * r * rho
-    
-    numerator = -G * m * rho / (r * r)
-    factor1 = 1.0 + P / (rho * c2)
-    factor2 = 1.0 + FOUR_PI * P * r * r * r / (m * c2)
-    denominator = 1.0 - TWO_G_C2 * m / r
-    
-    dP_dr = (numerator * factor1 * factor2) / denominator
-    
-    return dr_dr, dm_dr, dP_dr
 
-@jit(nopython=True, fastmath=True)
-def ns_solve_numba(rho_0, rho_arr, P_arr, dr=500.0, max_iter=80000, tol=1e-10):
-    """Ultra-fast RK4 solver with Numba JIT compilation"""
-    P_0 = interp_P(rho_0, rho_arr, P_arr)
-    
-    r = 500.0
-    m = 1.0
-    P = P_0
-    
-    for i in range(max_iter):
-        rho1 = interp_rho(P, rho_arr, P_arr)
-        k1_r, k1_m, k1_P = compute_derivatives(r, m, P, rho1)
-        
-        r2 = r + 0.5 * dr * k1_r
-        m2 = m + 0.5 * dr * k1_m
-        P2 = P + 0.5 * dr * k1_P
-        rho2 = interp_rho(P2, rho_arr, P_arr)
-        k2_r, k2_m, k2_P = compute_derivatives(r2, m2, P2, rho2)
-        
-        r3 = r + 0.5 * dr * k2_r
-        m3 = m + 0.5 * dr * k2_m
-        P3 = P + 0.5 * dr * k2_P
-        rho3 = interp_rho(P3, rho_arr, P_arr)
-        k3_r, k3_m, k3_P = compute_derivatives(r3, m3, P3, rho3)
-        
-        r4 = r + dr * k3_r
-        m4 = m + dr * k3_m
-        P4 = P + dr * k3_P
-        rho4 = interp_rho(P4, rho_arr, P_arr)
-        k4_r, k4_m, k4_P = compute_derivatives(r4, m4, P4, rho4)
-        
-        r += dr * (k1_r + 2*k2_r + 2*k3_r + k4_r) / 6.0
-        m += dr * (k1_m + 2*k2_m + 2*k3_m + k4_m) / 6.0
-        P += dr * (k1_P + 2*k2_P + 2*k3_P + k4_P) / 6.0
-        
-        if P / P_0 < tol or P < 0:
-            break
-    
-    return r, m, P
+@njit(fastmath=True, cache=True)
+def tov_mass_radius(rho_c, rho_t, P_t):
+    """(R [cm], M [g]) for one central density, without recording a profile."""
+    empty = np.empty(0)
+    R, M, _ = tov_integrate(rho_c, rho_t, P_t, empty, empty, empty, empty)
+    return R, M
 
-@jit(nopython=True, parallel=True, fastmath=True)
+
+@njit(parallel=True, fastmath=True, cache=True)
 def solve_all_densities(rho_array, rho_eos, P_eos):
-    """Solve for all densities in parallel"""
-    n = len(rho_array)
-    results = np.zeros((3, n))
-    
+    """Solve for all central densities in parallel. Returns [R; M] in cgs."""
+    n = rho_array.shape[0]
+    results = np.zeros((2, n))
     for i in prange(n):
-        r, m, P = ns_solve_numba(rho_array[i], rho_eos, P_eos)
-        results[0, i] = r
-        results[1, i] = m
-        results[2, i] = P
-    
+        R, M = tov_mass_radius(rho_array[i], rho_eos, P_eos)
+        results[0, i] = R
+        results[1, i] = M
     return results
 
+
+@njit(fastmath=True, cache=True)
+def tov_profile(rho_c, rho_t, P_t):
+    """Radial profile arrays (r, m, P, ρ) in cgs for one central density."""
+    rr = np.empty(PROFILE_MAX_POINTS)
+    mm = np.empty(PROFILE_MAX_POINTS)
+    pp = np.empty(PROFILE_MAX_POINTS)
+    dd = np.empty(PROFILE_MAX_POINTS)
+    _, _, n = tov_integrate(rho_c, rho_t, P_t, rr, mm, pp, dd)
+    return rr[:n], mm[:n], pp[:n], dd[:n]
+
+
+# ---------------------------------------------------------------------------
+# Python-level computations (with caching)
+# ---------------------------------------------------------------------------
 def compute_eos(eos_name, rho_arr, P_arr):
-    """Compute neutron star properties for given EOS"""
-    # Generate density array
-    rho = np.concatenate([
-        np.arange(2.5e14, 1e15, 0.5e13),
-        np.arange(1e15, 4e15, 0.5e14)
-    ])
-    
-    # Solve
-    results = solve_all_densities(rho, rho_arr, P_arr)
-    
-    R = results[0, :] / 1e5  # Convert to km
-    M = results[1, :] / 2e33  # Convert to solar masses
-    
+    """Compute the M(ρc), R(ρc) sequence for one EOS."""
+    with _solver_lock:
+        results = solve_all_densities(RHO_C_GRID, rho_arr, P_arr)
+    R = results[0] / 1e5      # km
+    M = results[1] / M_SUN    # M☉
+    i_max = int(np.argmax(M))
     return {
         'name': eos_name,
-        'rho': rho.tolist(),
+        'rho': RHO_C_GRID.tolist(),
         'R': R.tolist(),
         'M': M.tolist(),
-        'max_mass': float(np.max(M)),
-        'max_radius': float(R[np.argmax(M)]),
-        'raw_rho': rho_arr.tolist(),  # Store raw EOS data
-        'raw_P': P_arr.tolist()       # Store raw EOS data
+        'max_mass': float(M[i_max]),
+        'max_radius': float(R[i_max]),
+        'rho_c_max': float(RHO_C_GRID[i_max]),
     }
 
-def compute_inertia(m, r):
-    """Compute moment of inertia with robust error handling"""
-    try:
-        # Ensure inputs are numpy arrays
-        m = np.asarray(m, dtype=np.float64)
-        r = np.asarray(r, dtype=np.float64)
-        
-        # Filter out invalid values before computation
-        valid_mask = (m > 0) & (r > 0) & np.isfinite(m) & np.isfinite(r)
-        
-        if not np.any(valid_mask):
-            print("Warning: No valid M,R pairs for inertia computation")
-            return np.array([])
-        
-        # Apply mask
-        m_valid = m[valid_mask]
-        r_valid = r[valid_mask]
-        
-        # Compute compactness (dimensionless)
-        # M is in solar masses, R is in km
-        # Convert to geometric units: M_sun = 1.477 km in geometric units
-        m_km = m_valid * 1.477  # Convert solar masses to km (geometric units)
-        compactness = m_km / r_valid
-        
-        # Avoid extreme compactness values that cause numerical issues
-        compactness = np.clip(compactness, 0, 0.5)  # Max compactness ~0.5 for neutron stars
-        
-        # Compute moment of inertia
-        # I = k * M * R^2 where k depends on compactness
-        k = 0.237 + 0.008  # Base value
-        k = k * (1 + 4.2 * compactness + 90 * compactness**4)
-        
-        # I in units of 10^45 g·cm²
-        # M in M_sun (1.989e33 g), R in km (1e5 cm)
-        I = k * m_valid * (r_valid * 1e5)**2 * 1.989e33 / 1e45
-        
-        # Final safety check
-        I = np.where(np.isfinite(I) & (I > 0), I, np.nan)
-        
-        # Create full result array with NaN for invalid entries
-        result = np.full_like(m, np.nan, dtype=np.float64)
-        result[valid_mask] = I
-        
-        return result
-        
-    except Exception as e:
-        print(f"Error in inertia computation: {e}")
-        import traceback
-        traceback.print_exc()
-        return np.full_like(m, np.nan) if hasattr(m, '__len__') else np.nan
 
-@jit(nopython=True, fastmath=True)
-def tov_derivatives_profile_v2(r, m, P, rho):
-    """TOV derivatives for profile integration (used by integrate_tov_profile_v2)"""
-    if r < 1e-10:
-        return 0.0, 0.0
-    G = 6.67e-8
-    c = 3e10
-    c2 = c * c
-    FOUR_PI = 4.0 * np.pi
-    TWO_G_C2 = 2 * G / c2
-    dm_dr = FOUR_PI * r * r * rho
-    epsilon = rho * c2
-    numerator = -G * (epsilon + P / c2) * (m + FOUR_PI * r * r * r * P / c2)
-    denominator = r * (r - TWO_G_C2 * m)
-    if abs(denominator) < 1e-30:
-        return dm_dr, 0.0
-    dP_dr = numerator / denominator
-    return dm_dr, dP_dr
+def get_curve(eos_name):
+    """Cached M–R curve for an EOS (computed once per EOS, not once per request)."""
+    with _cache_lock:
+        cached = _curve_cache.get(eos_name)
+    if cached is not None:
+        return cached
+    eos = eos_cache[eos_name]
+    curve = compute_eos(eos_name, eos['rho'], eos['P'])
+    with _cache_lock:
+        _curve_cache[eos_name] = curve
+    return curve
 
 
-@jit(nopython=True, fastmath=True)
-def integrate_tov_profile_v2(rho_0, rho_arr, P_arr, dr=500.0, max_iter=80000, tol=1e-10):
-    """
-    Profile integrator using the SAME logic as ns_solve_numba (which is known to work),
-    but records r, m, rho at every step to build the density profile.
-    """
-    P_0 = interp_P(rho_0, rho_arr, P_arr)
+def find_rho_c_for_mass(target_mass_solar, eos_name):
+    """Central density giving the target mass on the stable branch (ρc ≤ ρc(M_max))."""
+    eos = eos_cache[eos_name]
+    rho_t, P_t = eos['rho'], eos['P']
+    curve = get_curve(eos_name)
+    rho_grid = np.asarray(curve['rho'])
+    M_grid = np.asarray(curve['M'])
+    i_max = int(np.argmax(M_grid))
+    M_max = M_grid[i_max]
 
-    r = 500.0
-    m = 1.0
-    P = P_0
+    if target_mass_solar > M_max:
+        raise ValueError(f"{target_mass_solar:.3f} M☉ exceeds the maximum mass "
+                         f"{M_max:.3f} M☉ of this EOS")
 
-    r_arr_out = np.zeros(max_iter)
-    m_arr_out = np.zeros(max_iter)
-    rho_arr_out = np.zeros(max_iter)
+    def mass_diff(rho_c):
+        with _solver_lock:
+            _, M = tov_mass_radius(rho_c, rho_t, P_t)
+        return M / M_SUN - target_mass_solar
 
-    # Store initial values
-    rho_arr_out[0] = rho_0
-    r_arr_out[0] = r
-    m_arr_out[0] = m
-    idx = 1
+    stable_rho = rho_grid[:i_max + 1]
+    stable_M = M_grid[:i_max + 1]
 
-    for i in range(max_iter):
-        rho1 = interp_rho(P, rho_arr, P_arr)
-        k1_r, k1_m, k1_P = compute_derivatives(r, m, P, rho1)
-
-        r2 = r + 0.5 * dr * k1_r
-        m2 = m + 0.5 * dr * k1_m
-        P2 = P + 0.5 * dr * k1_P
-        rho2 = interp_rho(P2, rho_arr, P_arr)
-        k2_r, k2_m, k2_P = compute_derivatives(r2, m2, P2, rho2)
-
-        r3 = r + 0.5 * dr * k2_r
-        m3 = m + 0.5 * dr * k2_m
-        P3 = P + 0.5 * dr * k2_P
-        rho3 = interp_rho(P3, rho_arr, P_arr)
-        k3_r, k3_m, k3_P = compute_derivatives(r3, m3, P3, rho3)
-
-        r4 = r + dr * k3_r
-        m4 = m + dr * k3_m
-        P4 = P + dr * k3_P
-        rho4 = interp_rho(P4, rho_arr, P_arr)
-        k4_r, k4_m, k4_P = compute_derivatives(r4, m4, P4, rho4)
-
-        r += dr * (k1_r + 2*k2_r + 2*k3_r + k4_r) / 6.0
-        m += dr * (k1_m + 2*k2_m + 2*k3_m + k4_m) / 6.0
-        P += dr * (k1_P + 2*k2_P + 2*k3_P + k4_P) / 6.0
-
-        if P / P_0 < tol or P < 0:
-            break
-
-        rho_cur = interp_rho(P, rho_arr, P_arr)
-        r_arr_out[idx] = r
-        m_arr_out[idx] = m
-        rho_arr_out[idx] = rho_cur
-        idx += 1
-
-    R_final = r_arr_out[idx - 1]
-    M_final = m_arr_out[idx - 1]
-    return r_arr_out[:idx], m_arr_out[:idx], rho_arr_out[:idx], R_final, M_final
-
-
-@jit(nopython=True, fastmath=True)
-def tov_derivatives_profile(r, m, P, rho):
-    """
-    Compute TOV equation derivatives - CORRECTED VERSION
-    
-    dm/dr = 4π r² ρ (mass density in g/cm³)
-    dP/dr = -G(ε + P/c²)(m + 4πr³P/c²) / [r(r - 2Gm/c²)]
-    
-    where ε = ρc² is the energy density
-    
-    Parameters:
-    - r: radius (cm)
-    - m: enclosed mass (g)
-    - P: pressure (dyn/cm²)
-    - rho: mass density (g/cm³)
-    
-    Returns: (dm/dr, dP/dr)
-    """
-    if r < 1e-10:
-        return 0.0, 0.0
-    
-    # Constants (from global scope)
-    G = 6.67e-8
-    c = 3e10
-    c2 = c * c
-    FOUR_PI = 4.0 * np.pi
-    TWO_G_C2 = 2 * G / c2
-    
-    # dm/dr = 4π r² ρ (mass density!)
-    dm_dr = FOUR_PI * r * r * rho
-    
-    # For pressure equation, use energy density ε = ρc²
-    epsilon = rho * c2
-    
-    # dP/dr equation
-    numerator = -G * (epsilon + P / c2) * (m + FOUR_PI * r * r * r * P / c2)
-    denominator = r * (r - TWO_G_C2 * m)
-    
-    if abs(denominator) < 1e-30:
-        return dm_dr, 0.0
-    
-    dP_dr = numerator / denominator
-    
-    return dm_dr, dP_dr
-
-@jit(nopython=True, fastmath=True)
-def integrate_tov_profile(rho_c, rho_arr, P_arr, r0=500.0, dr=500.0, max_iter=80000):
-    """
-    Integrate TOV equations - CORRECTED VERSION
-    
-    Parameters:
-    - rho_c: Central density (g/cm³)
-    - rho_arr, P_arr: EOS arrays
-    - r0: Starting radius (cm), default 500 cm = 0.005 km
-    - dr: Step size (cm)
-    - max_iter: Maximum iterations
-    
-    Returns:
-    - r_array, m_array, P_array, rho_array, R_final, M_final
-    """
-    # Constants
-    G = 6.67e-8
-    c = 3e10
-    c2 = c * c
-    FOUR_PI = 4.0 * np.pi
-    TWO_G_C2 = 2 * G / c2
-    P_SURF = 1e20
-    
-    # Get central pressure from EOS
-    P_c = interp_P(rho_c, rho_arr, P_arr)
-    
-    # Initial conditions at r0
-    r = r0
-    # CORRECTED: m(r0) = (4/3)π r0³ ρc (NOT ρc c²)
-    m = (4.0/3.0) * np.pi * r0**3 * rho_c
-    P = P_c
-    
-    # Storage arrays
-    r_arr_out = np.zeros(max_iter)
-    m_arr_out = np.zeros(max_iter)
-    P_arr_out = np.zeros(max_iter)
-    rho_arr_out = np.zeros(max_iter)
-    
-    # Store initial values
-    r_arr_out[0] = r
-    m_arr_out[0] = m
-    P_arr_out[0] = P
-    rho_arr_out[0] = rho_c
-    
-    idx = 1
-    
-    # RK4 integration
-    for i in range(1, max_iter):
-        rho = interp_rho(P, rho_arr, P_arr)
-        
-        # RK4 step
-        k1_m, k1_P = tov_derivatives_profile(r, m, P, rho)
-        
-        r2 = r + 0.5 * dr
-        m2 = m + 0.5 * dr * k1_m
-        P2 = P + 0.5 * dr * k1_P
-        rho2 = interp_rho(P2, rho_arr, P_arr)
-        k2_m, k2_P = tov_derivatives_profile(r2, m2, P2, rho2)
-        
-        r3 = r + 0.5 * dr
-        m3 = m + 0.5 * dr * k2_m
-        P3 = P + 0.5 * dr * k2_P
-        rho3 = interp_rho(P3, rho_arr, P_arr)
-        k3_m, k3_P = tov_derivatives_profile(r3, m3, P3, rho3)
-        
-        r4 = r + dr
-        m4 = m + dr * k3_m
-        P4 = P + dr * k3_P
-        rho4 = interp_rho(P4, rho_arr, P_arr)
-        k4_m, k4_P = tov_derivatives_profile(r4, m4, P4, rho4)
-        
-        # Update
-        r += dr
-        m += dr * (k1_m + 2*k2_m + 2*k3_m + k4_m) / 6.0
-        P += dr * (k1_P + 2*k2_P + 2*k3_P + k4_P) / 6.0
-        
-        # Stop if pressure drops below surface threshold
-        if P <= P_SURF or P < 0:
-            break
-        
-        # Store values
-        rho_arr_out[idx] = interp_rho(P, rho_arr, P_arr)
-        r_arr_out[idx] = r
-        m_arr_out[idx] = m
-        P_arr_out[idx] = P
-        idx += 1
-    
-    # Return only filled portion
-    return (r_arr_out[:idx], m_arr_out[:idx], P_arr_out[:idx], 
-            rho_arr_out[:idx], r, m)
-
-def find_rho_c_for_mass_v2(target_mass_solar, rho_arr, P_arr, M_rho_grid=None):
-    """
-    Find central density for target mass - CORRECTED VERSION
-    """
-    target_mass_g = target_mass_solar * 2e33
-    
-    if M_rho_grid is not None:
-        rho_grid, M_grid = M_rho_grid
-        max_idx = np.argmax(M_grid)
-        M_max = M_grid[max_idx]
-        
-        print(f"  M_max for this EOS: {M_max:.3f} M☉")
-        print(f"  Target mass: {target_mass_solar:.3f} M☉")
-        
-        if target_mass_solar > M_max:
-            raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ exceeds maximum "
-                           f"{M_max:.3f} M☉ for this EOS")
-        
-        M_min = M_grid[0]
-        if target_mass_solar < M_min:
-            raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ is below minimum "
-                           f"{M_min:.3f} M☉ for this EOS")
-        
-        stable_rho = rho_grid[:max_idx+1]
-        stable_M = M_grid[:max_idx+1]
-        
-        idx = np.searchsorted(stable_M, target_mass_solar)
-        
-        if idx == 0:
-            rho_low = stable_rho[0]
-            rho_high = stable_rho[1]
-        elif idx >= len(stable_M):
-            rho_low = stable_rho[-2]
-            rho_high = stable_rho[-1]
-        else:
-            rho_low = stable_rho[idx-1]
-            rho_high = stable_rho[idx]
-        
-        print(f"  Bracketing: rho_c ∈ [{rho_low:.3e}, {rho_high:.3e}] g/cm³")
+    if target_mass_solar < stable_M[0]:
+        # light star: walk down in central density until the mass is bracketed
+        rho_hi = stable_rho[0]
+        rho_lo = rho_hi
+        rho_floor = max(rho_t[0], 1e13)
+        while True:
+            rho_lo = rho_lo / 1.5
+            if rho_lo < rho_floor:
+                raise ValueError(f"{target_mass_solar:.3f} M☉ is below the lightest "
+                                 f"star that can be bracketed for this EOS")
+            if mass_diff(rho_lo) < 0:
+                break
+            rho_hi = rho_lo
     else:
-        rho_low = 1e14
-        rho_high = 5e15
-    
-    def mass_difference(rho_c):
-        try:
-            _, _, _, R, M = integrate_tov_profile_v2(rho_c, rho_arr, P_arr)
-            diff = M - target_mass_g
-            return diff
-        except Exception as e:
-            print(f"    Error at rho_c={rho_c:.3e}: {e}")
-            return np.inf
-    
-    f_low = mass_difference(rho_low)
-    f_high = mass_difference(rho_high)
-    
-    print(f"  f(rho_low) = {f_low/2e33:.6f} M☉")
-    print(f"  f(rho_high) = {f_high/2e33:.6f} M☉")
-    
-    if f_low * f_high > 0:
-        print(f"  Initial bracket has same sign, expanding search...")
-        
-        if abs(f_low) < abs(f_high):
-            rho_low = max(rho_low * 0.5, rho_arr[0])
-            f_low = mass_difference(rho_low)
-            print(f"  Expanded low: rho={rho_low:.3e}, f={f_low/2e33:.6f} M☉")
-        else:
-            rho_high = min(rho_high * 1.5, rho_arr[-1])
-            f_high = mass_difference(rho_high)
-            print(f"  Expanded high: rho={rho_high:.3e}, f={f_high/2e33:.6f} M☉")
-        
-        if f_low * f_high > 0:
-            raise ValueError(
-                f"Cannot bracket target mass {target_mass_solar:.3f} M☉. "
-                f"Mass at rho_low={rho_low:.2e}: {(f_low/2e33 + target_mass_solar):.3f} M☉, "
-                f"Mass at rho_high={rho_high:.2e}: {(f_high/2e33 + target_mass_solar):.3f} M☉"
-            )
-    
-    print(f"  Starting Brent's method...")
-    rho_c = brentq(mass_difference, rho_low, rho_high, xtol=1e12, maxiter=100)
-    print(f"  Converged to rho_c = {rho_c:.3e} g/cm³")
-    
-    return rho_c
-    
-def create_plot(results, plot_type):
-    """Create Plotly figure based on plot type with proper error handling"""
-    try:
-        fig = go.Figure()
-        
-        if not results:
-            fig.add_annotation(text="No data available", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-            return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
-        
-        if plot_type == 'mass-rho':
-            for result in results:
-                if 'rho' in result and 'M' in result and len(result['rho']) > 0 and len(result['M']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['rho'],
-                        y=result['M'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Mass vs Central Density',
-                xaxis_title='ρc (g/cm³)',
-                yaxis_title='Mass (M☉)',
-                xaxis_type='log',
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'radius-rho':
-            for result in results:
-                if 'rho' in result and 'R' in result and len(result['rho']) > 0 and len(result['R']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['rho'],
-                        y=result['R'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Radius vs Central Density',
-                xaxis_title='ρc (g/cm³)',
-                yaxis_title='Radius (km)',
-                xaxis_type='log',
-                yaxis=dict(range=[9, 30]),
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'mass-radius':
-            for result in results:
-                if 'R' in result and 'M' in result and len(result['R']) > 0 and len(result['M']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['R'],
-                        y=result['M'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Mass vs Radius',
-                xaxis_title='Radius (km)',
-                yaxis_title='Mass (M☉)',
-                xaxis=dict(range=[8, 20]),
-                yaxis=dict(range=[0, 3]),
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'inertia':
-            traces_added = 0
-            for result in results:
-                try:
-                    if 'M' not in result or 'R' not in result:
-                        print(f"Skipping {result.get('name', 'unknown')}: Missing M or R data")
-                        continue
-                    
-                    M = np.array(result['M'])
-                    R = np.array(result['R'])
-                    
-                    if len(M) == 0 or len(R) == 0:
-                        print(f"Skipping {result.get('name', 'unknown')}: Empty arrays")
-                        continue
-                    
-                    # Find stable branch (up to maximum mass)
-                    max_idx = np.argmax(M)
-                    if max_idx < 2:  # Need at least a few points
-                        print(f"Skipping {result.get('name', 'unknown')}: Insufficient stable points")
-                        continue
-                    
-                    M_stable = M[:max_idx+1]
-                    R_stable = R[:max_idx+1]
-                    
-                    print(f"Computing inertia for {result.get('name', 'unknown')}: {len(M_stable)} points")
-                    print(f"  M range: [{M_stable.min():.3f}, {M_stable.max():.3f}]")
-                    print(f"  R range: [{R_stable.min():.3f}, {R_stable.max():.3f}]")
-                    
-                    # Compute inertia
-                    I = compute_inertia(M_stable, R_stable)
-                    
-                    # Filter valid values (not NaN, not Inf, positive)
-                    valid_mask = np.isfinite(I) & (I > 0) & (I < 1000)  # Sanity check on upper bound
-                    
-                    valid_count = np.sum(valid_mask)
-                    print(f"  Valid inertia points: {valid_count}/{len(I)}")
-                    
-                    if valid_count > 0:
-                        M_plot = M_stable[valid_mask]
-                        I_plot = I[valid_mask]
-                        
-                        print(f"  I range: [{I_plot.min():.2f}, {I_plot.max():.2f}]")
-                        
-                        fig.add_trace(go.Scatter(
-                            x=M_plot.tolist(),
-                            y=I_plot.tolist(),
-                            mode='lines',
-                            name=result['name'],
-                            line=dict(color=result.get('color', '#000000'), width=2)
-                        ))
-                        traces_added += 1
-                    else:
-                        print(f"  No valid inertia values for {result.get('name', 'unknown')}")
-                    
-                except Exception as e:
-                    print(f"Error computing inertia for {result.get('name', 'unknown')}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-            
-            print(f"Total traces added to inertia plot: {traces_added}")
-            
-            fig.update_layout(
-                title='Moment of Inertia',
-                xaxis_title='Mass (M☉)',
-                yaxis_title='I (10⁴⁵ g·cm²)',
-                xaxis=dict(range=[1, 2.7]),
-                template='plotly_dark'
-            )
-        
-        elif plot_type == 'eos':
-            # NEW: Plot raw EoS data with logarithmic axes
-            for result in results:
-                if 'raw_rho' in result and 'raw_P' in result and len(result['raw_rho']) > 0 and len(result['raw_P']) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=result['raw_rho'],
-                        y=result['raw_P'],
-                        mode='lines',
-                        name=result['name'],
-                        line=dict(color=result.get('color', '#000000'), width=2)
-                    ))
-            fig.update_layout(
-                title='Equation of State: Pressure vs Density',
-                xaxis_title='ρ (g/cm³)',
-                yaxis_title='P (dyn/cm²)',
-                xaxis_type='log',
-                yaxis_type='log',
-                template='plotly_dark'
-            )
-        
-        else:
-            fig.add_annotation(text=f"Invalid plot type: {plot_type}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-        
-        # Ensure we have at least one trace
-        if len(fig.data) == 0:
-            fig.add_annotation(text="No valid data to display", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-            print("WARNING: No traces added to plot!")
-        
-        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
-    
-    except Exception as e:
-        print(f"Error in create_plot: {e}")
-        import traceback
-        traceback.print_exc()
-        # Return a basic error plot
-        fig = go.Figure()
-        fig.add_annotation(text=f"Error creating plot: {str(e)}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
-        return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
+        idx = int(np.searchsorted(stable_M, target_mass_solar))
+        idx = min(max(idx, 1), len(stable_M) - 1)
+        rho_lo, rho_hi = stable_rho[idx - 1], stable_rho[idx]
+        if mass_diff(rho_lo) * mass_diff(rho_hi) > 0:
+            # non-monotonic stretch of the curve: fall back to the full stable range
+            rho_lo, rho_hi = stable_rho[0], stable_rho[-1]
+
+    return brentq(mass_diff, rho_lo, rho_hi, xtol=1e-10 * rho_hi, rtol=1e-10, maxiter=200)
+
+
+def compute_profile(eos_name, mode, value):
+    """
+    Density profile ρ(r) of a single star.
+    mode = 'mass'  -> value is the gravitational mass in M☉ (stable branch)
+    mode = 'rho_c' -> value is the central density in g/cm³
+    Returns (profile dict, list of warnings).
+    """
+    key = (eos_name, mode, float(value))
+    with _cache_lock:
+        cached = _profile_cache.get(key)
+    if cached is not None:
+        return cached
+
+    warnings = []
+    eos = eos_cache[eos_name]
+    curve = get_curve(eos_name)
+
+    if mode == 'mass':
+        rho_c = find_rho_c_for_mass(value, eos_name)
+    else:
+        rho_c = float(value)
+        if rho_c > eos['rho'][-1]:
+            warnings.append(f"{eos_name}: ρc is above the last EOS table point "
+                            f"({eos['rho'][-1]:.2e} g/cm³); the EOS is held constant there")
+        if rho_c > curve['rho_c_max']:
+            warnings.append(f"{eos_name}: ρc = {rho_c:.2e} g/cm³ is beyond the maximum-mass "
+                            f"configuration (≈{curve['rho_c_max']:.2e} g/cm³) - unstable branch")
+
+    with _solver_lock:
+        r, m, P, rho = tov_profile(rho_c, eos['rho'], eos['P'])
+
+    out = ({
+        'rho_c': float(rho_c),
+        'M': float(m[-1] / M_SUN),
+        'R': float(r[-1] / 1e5),
+        'r': (r / 1e5).tolist(),            # km
+        'density': rho.tolist(),            # g/cm³
+        'm': (m / M_SUN).tolist(),          # M☉
+        'P': P.tolist(),                    # dyn/cm²
+    }, warnings)
+    with _cache_lock:
+        if len(_profile_cache) >= PROFILE_CACHE_SIZE:
+            _profile_cache.pop(next(iter(_profile_cache)))   # drop the oldest entry
+        _profile_cache[key] = out
+    return out
+
+
+def compute_inertia(m, r):
+    """Moment of inertia from an empirical fit, I = k(C)·M·R² (10⁴⁵ g·cm²)."""
+    m = np.asarray(m, dtype=np.float64)
+    r = np.asarray(r, dtype=np.float64)
+    result = np.full_like(m, np.nan, dtype=np.float64)
+    valid = (m > 0) & (r > 0) & np.isfinite(m) & np.isfinite(r)
+    if not np.any(valid):
+        return result
+    m_v, r_v = m[valid], r[valid]
+    compactness = np.clip(m_v * 1.477 / r_v, 0, 0.5)
+    k = (0.237 + 0.008) * (1 + 4.2 * compactness + 90 * compactness ** 4)
+    I = k * m_v * (r_v * 1e5) ** 2 * 1.989e33 / 1e45
+    result[valid] = np.where(np.isfinite(I) & (I > 0), I, np.nan)
+    return result
+
+
+def _stable_inertia(result):
+    """(M, I) on the stable branch, or None."""
+    M = np.asarray(result.get('M', []), dtype=np.float64)
+    R = np.asarray(result.get('R', []), dtype=np.float64)
+    if len(M) == 0 or len(R) == 0:
+        return None
+    i_max = int(np.argmax(M))
+    if i_max < 2:
+        return None
+    M_s, R_s = M[:i_max + 1], R[:i_max + 1]
+    I = compute_inertia(M_s, R_s)
+    ok = np.isfinite(I) & (I > 0) & (I < 1000)
+    return M_s[ok], I[ok]
+
+
+# ---------------------------------------------------------------------------
+# Plotting (plain Plotly JSON; no server-side plotly import needed)
+# ---------------------------------------------------------------------------
+_AXIS_DARK = dict(gridcolor='#283442', linecolor='#506784', zerolinecolor='#283442',
+                  ticks='', automargin=True)
+_LAYOUT_DARK = dict(
+    paper_bgcolor='rgb(17,17,17)', plot_bgcolor='rgb(17,17,17)',
+    font=dict(color='#f2f5fa'), hovermode='closest',
+    hoverlabel=dict(align='left'), legend=dict(bgcolor='rgba(0,0,0,0)'),
+    margin=dict(l=70, r=30, t=60, b=60),
+)
+
+
+def _line(x, y, name, color, **extra):
+    trace = dict(type='scatter', mode='lines', x=x, y=y, name=name,
+                 line=dict(color=color or '#ffffff', width=2))
+    trace.update(extra)
+    return trace
+
+
+def _layout(title, xaxis, yaxis):
+    layout = dict(_LAYOUT_DARK)
+    layout['title'] = dict(text=title)
+    layout['xaxis'] = {**_AXIS_DARK, **xaxis}
+    layout['yaxis'] = {**_AXIS_DARK, **yaxis}
+    return layout
+
+
+def create_plot(results, plot_type, options=None):
+    """Return a Plotly figure dict {data, layout}."""
+    options = options or {}
+    data = []
+
+    if plot_type == 'mass-rho':
+        data = [_line(r['rho'], r['M'], r['name'], r.get('color')) for r in results]
+        layout = _layout('Mass vs Central Density',
+                         dict(title=dict(text='ρc (g/cm³)'), type='log'),
+                         dict(title=dict(text='Mass (M☉)')))
+    elif plot_type == 'radius-rho':
+        data = [_line(r['rho'], r['R'], r['name'], r.get('color')) for r in results]
+        layout = _layout('Radius vs Central Density',
+                         dict(title=dict(text='ρc (g/cm³)'), type='log'),
+                         dict(title=dict(text='Radius (km)'), range=[9, 30]))
+    elif plot_type == 'mass-radius':
+        data = [_line(r['R'], r['M'], r['name'], r.get('color')) for r in results]
+        layout = _layout('Mass vs Radius',
+                         dict(title=dict(text='Radius (km)'), range=[8, 20]),
+                         dict(title=dict(text='Mass (M☉)'), range=[0, 3]))
+    elif plot_type == 'inertia':
+        for r in results:
+            mi = _stable_inertia(r)
+            if mi is not None and len(mi[0]):
+                data.append(_line(mi[0].tolist(), mi[1].tolist(), r['name'], r.get('color')))
+        layout = _layout('Moment of Inertia',
+                         dict(title=dict(text='Mass (M☉)'), range=[1, 2.7]),
+                         dict(title=dict(text='I (10⁴⁵ g·cm²)')))
+    elif plot_type == 'eos':
+        data = [_line(r['raw_rho'], r['raw_P'], r['name'], r.get('color'))
+                for r in results if 'raw_rho' in r]
+        layout = _layout('Equation of State: Pressure vs Density',
+                         dict(title=dict(text='ρ (g/cm³)'), type='log'),
+                         dict(title=dict(text='P (dyn/cm²)'), type='log'))
+    elif plot_type == 'profile':
+        log_y = bool(options.get('log_scale', False))
+        for r in results:
+            p = r.get('profile')
+            if not p:
+                continue
+            label = f"{r['name']}  (M={p['M']:.3f} M☉, R={p['R']:.2f} km)"
+            data.append(_line(
+                p['r'], p['density'], label, r.get('color'),
+                customdata=p['m'],
+                hovertemplate=('r = %{x:.3f} km<br>ρ = %{y:.4e} g/cm³'
+                               '<br>m(r) = %{customdata:.4f} M☉<extra>' + r['name'] + '</extra>')))
+        layout = _layout('Density Profile ρ(r)',
+                         dict(title=dict(text='r (km)'), rangemode='tozero'),
+                         dict(title=dict(text='ρ (g/cm³)'),
+                              type='log' if log_y else 'linear',
+                              exponentformat='power'))
+        if data:
+            layout['shapes'] = [dict(type='line', xref='paper', x0=0, x1=1, yref='y',
+                                     y0=RHO_SAT, y1=RHO_SAT,
+                                     line=dict(color='#94a3b8', width=1, dash='dot'))]
+            layout['annotations'] = [dict(xref='paper', x=1, xanchor='right', yref='y',
+                                          y=np.log10(RHO_SAT) if log_y else RHO_SAT,
+                                          yanchor='bottom', showarrow=False,
+                                          text='ρ₀ (nuclear saturation)',
+                                          font=dict(size=11, color='#94a3b8'))]
+    else:
+        layout = _layout(f'Invalid plot type: {plot_type}', {}, {})
+
+    if not data:
+        layout['annotations'] = [dict(text='No valid data to display', xref='paper',
+                                      yref='paper', x=0.5, y=0.5, showarrow=False)]
+    return {'data': data, 'layout': layout}
+
 
 def generate_csv_data(results, plot_type):
     """Generate CSV data for the selected plot type"""
     if not results:
         return "No data available"
-    
-    csv_lines = []
-    
+
+    lines = []
     if plot_type == 'mass-rho':
-        csv_lines.append("EOS,Central Density (g/cm³),Mass (M☉)")
-        for result in results:
-            if 'rho' in result and 'M' in result:
-                for rho, mass in zip(result['rho'], result['M']):
-                    csv_lines.append(f"{result['name']},{rho},{mass}")
-    
+        lines.append("EOS,Central Density (g/cm³),Mass (M☉)")
+        for r in results:
+            lines += [f"{r['name']},{a},{b}" for a, b in zip(r.get('rho', []), r.get('M', []))]
     elif plot_type == 'radius-rho':
-        csv_lines.append("EOS,Central Density (g/cm³),Radius (km)")
-        for result in results:
-            if 'rho' in result and 'R' in result:
-                for rho, radius in zip(result['rho'], result['R']):
-                    csv_lines.append(f"{result['name']},{rho},{radius}")
-    
+        lines.append("EOS,Central Density (g/cm³),Radius (km)")
+        for r in results:
+            lines += [f"{r['name']},{a},{b}" for a, b in zip(r.get('rho', []), r.get('R', []))]
     elif plot_type == 'mass-radius':
-        csv_lines.append("EOS,Radius (km),Mass (M☉)")
-        for result in results:
-            if 'R' in result and 'M' in result:
-                for radius, mass in zip(result['R'], result['M']):
-                    csv_lines.append(f"{result['name']},{radius},{mass}")
-    
+        lines.append("EOS,Radius (km),Mass (M☉)")
+        for r in results:
+            lines += [f"{r['name']},{a},{b}" for a, b in zip(r.get('R', []), r.get('M', []))]
     elif plot_type == 'inertia':
-        csv_lines.append("EOS,Mass (M☉),Inertia (10⁴⁵ g·cm²)")
-        for result in results:
-            if 'M' in result and 'R' in result:
-                M = np.array(result['M'])
-                R = np.array(result['R'])
-                
-                # Find stable branch
-                max_idx = np.argmax(M)
-                if max_idx >= 2:
-                    M_stable = M[:max_idx+1]
-                    R_stable = R[:max_idx+1]
-                    I = compute_inertia(M_stable, R_stable)
-                    
-                    for mass, inertia in zip(M_stable, I):
-                        if np.isfinite(inertia) and inertia > 0:
-                            csv_lines.append(f"{result['name']},{mass},{inertia}")
-    
+        lines.append("EOS,Mass (M☉),Inertia (10⁴⁵ g·cm²)")
+        for r in results:
+            mi = _stable_inertia(r)
+            if mi is not None:
+                lines += [f"{r['name']},{a},{b}" for a, b in zip(*mi)]
     elif plot_type == 'eos':
-        csv_lines.append("EOS,Density (g/cm³),Pressure (dyn/cm²)")
-        for result in results:
-            if 'raw_rho' in result and 'raw_P' in result:
-                for rho, pressure in zip(result['raw_rho'], result['raw_P']):
-                    csv_lines.append(f"{result['name']},{rho},{pressure}")
-    
+        lines.append("EOS,Density (g/cm³),Pressure (dyn/cm²)")
+        for r in results:
+            lines += [f"{r['name']},{a},{b}"
+                      for a, b in zip(r.get('raw_rho', []), r.get('raw_P', []))]
+    elif plot_type == 'profile':
+        lines.append("EOS,Central Density (g/cm³),r (km),Density (g/cm³),"
+                     "Enclosed Mass m(r) (M☉),Pressure (dyn/cm²)")
+        for r in results:
+            p = r.get('profile')
+            if not p:
+                continue
+            rc = p['rho_c']
+            lines += [f"{r['name']},{rc},{a},{b},{mm},{pp}"
+                      for a, b, mm, pp in zip(p['r'], p['density'], p['m'], p['P'])]
     else:
         return f"Unknown plot type: {plot_type}"
-    
-    return "\n".join(csv_lines)
+    return "\n".join(lines)
 
 
-def find_rho_c_for_mass(target_mass_solar, rho_arr, P_arr, M_rho_grid):
-    """Find central density for a target mass using Brent's method"""
-    target_mass_g = target_mass_solar * 2e33
-    rho_grid, M_grid = M_rho_grid
-    max_idx = np.argmax(M_grid)
-    M_max = M_grid[max_idx]
-
-    if target_mass_solar > M_max:
-        raise ValueError(f"Target mass {target_mass_solar:.3f} M☉ exceeds maximum {M_max:.3f} M☉ for this EOS")
-
-    stable_rho = rho_grid[:max_idx+1]
-    stable_M = M_grid[:max_idx+1]
-
-    idx = np.searchsorted(stable_M, target_mass_solar)
-    if idx == 0:
-        rho_low, rho_high = stable_rho[0], stable_rho[1]
-    elif idx >= len(stable_M):
-        rho_low, rho_high = stable_rho[-2], stable_rho[-1]
-    else:
-        rho_low, rho_high = stable_rho[idx-1], stable_rho[idx]
-
-    def mass_diff(rho_c):
-        _, _, _, R, M = integrate_tov_profile_v2(rho_c, rho_arr, P_arr)
-        return M - target_mass_g
-
-    rho_c = brentq(mass_diff, rho_low, rho_high, xtol=1e12, maxiter=100)
-    return rho_c
-
-
+# ---------------------------------------------------------------------------
 # Routes
+# ---------------------------------------------------------------------------
 @app.route('/')
 def index():
     """Render main page"""
-    # Only include EOS that are actually loaded
-    eos_list = [{'name': name, 'color': color} 
-                for name, _, _, color in EOS_CONFIG 
-                if name in eos_cache]
-    
-    print(f"\nServing index page with {len(eos_list)} available EOS")
+    eos_list = [{'name': name, 'color': color}
+                for name, _, _, color in EOS_CONFIG if name in eos_cache]
     return render_template('index.html', eos_list=eos_list)
+
 
 @app.route('/compute', methods=['POST'])
 def compute():
     """Compute neutron star properties"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         selected_eos = data.get('eos', [])
         plot_type = data.get('plot_type', 'mass-radius')
-        
-        print(f"\nCompute request received:")
-        print(f"  Selected EOS: {selected_eos}")
-        print(f"  Plot type: {plot_type}")
-        
+        profile_opts = data.get('profile') or {}
+
         if not selected_eos:
             return jsonify({'error': 'No EOS selected'}), 400
-        
-        results = []
-        
+
+        mode = profile_opts.get('mode', 'mass')
+        if plot_type == 'profile':
+            if mode not in ('mass', 'rho_c'):
+                return jsonify({'error': f'Unknown profile mode: {mode}'}), 400
+            try:
+                value = float(profile_opts.get('value'))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Enter a numeric mass or central density'}), 400
+            if not np.isfinite(value) or value <= 0:
+                return jsonify({'error': 'The mass / central density must be positive'}), 400
+
+        results, warnings = [], []
         for eos_name in selected_eos:
             if eos_name not in eos_cache:
-                print(f"  Warning: {eos_name} not found in cache")
+                warnings.append(f"{eos_name}: not loaded")
                 continue
-                
-            print(f"  Computing {eos_name}...")
-            result = compute_eos(
-                eos_name,
-                eos_cache[eos_name]['rho'],
-                eos_cache[eos_name]['P']
-            )
-            result['color'] = eos_cache[eos_name]['color']
+            eos = eos_cache[eos_name]
+            curve = get_curve(eos_name)
+            result = {k: curve[k] for k in ('name', 'rho', 'R', 'M', 'max_mass', 'max_radius')}
+            result['color'] = eos['color']
+            if plot_type == 'eos':
+                result['raw_rho'] = eos['rho'].tolist()
+                result['raw_P'] = eos['P'].tolist()
+            elif plot_type == 'profile':
+                try:
+                    prof, w = compute_profile(eos_name, mode, value)
+                    result['profile'] = prof
+                    warnings += w
+                except ValueError as e:
+                    warnings.append(f"{eos_name}: {e}")
+                    continue
             results.append(result)
-            print(f"    ✓ Max mass: {result['max_mass']:.3f} M☉, Max radius: {result['max_radius']:.3f} km")
-        
-        plot_json = create_plot(results, plot_type)
-        
+
+        options = {'log_scale': bool(profile_opts.get('log_scale', False))}
         return jsonify({
-            'plot': plot_json,
-            'results': results
+            'plot': create_plot(results, plot_type, options),
+            'results': results,
+            'warnings': warnings,
         })
-        
+
     except Exception as e:
-        print(f"Error in compute: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
     """Upload custom EOS file"""
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
-    
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
-    
+
     try:
-        # Read CSV
         df = pd.read_csv(file)
-        
-        # Check for required columns
         if 'rho' not in df.columns or 'P' not in df.columns:
             return jsonify({'error': 'CSV must have "rho" and "P" columns'}), 400
-        
-        # Store in cache
-        eos_name = secure_filename(file.filename).replace('.csv', '').upper()
-        eos_cache[eos_name] = {
-            'rho': df['rho'].values.astype(np.float64),
-            'P': df['P'].values.astype(np.float64),
-            'color': '#FF0000'  # Custom EOS in red
-        }
-        
-        return jsonify({
-            'success': True,
-            'name': eos_name,
-            'color': '#FF0000'
-        })
-    
+        rho, P = _clean_eos(pd.to_numeric(df['rho'], errors='coerce').values,
+                            pd.to_numeric(df['P'], errors='coerce').values)
+
+        eos_name = secure_filename(file.filename).replace('.csv', '').upper() or 'CUSTOM'
+        with _cache_lock:
+            eos_cache[eos_name] = {'rho': rho, 'P': P, 'color': '#FF0000'}
+            _curve_cache.pop(eos_name, None)   # invalidate any old results
+            for k in [k for k in _profile_cache if k[0] == eos_name]:
+                del _profile_cache[k]
+        return jsonify({'success': True, 'name': eos_name, 'color': '#FF0000'})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
+
 
 @app.route('/download_csv', methods=['POST'])
 def download_csv():
     """Download CSV with the calculated data of the selected plot type"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         results = data.get('results', [])
         plot_type = data.get('plot_type', 'mass-radius')
-        
         if not results:
             return jsonify({'error': 'No data available for download'}), 400
-        
         csv_data = generate_csv_data(results, plot_type)
-        
-        # Create in-memory file
-        output = io.StringIO()
-        output.write(csv_data)
-        
         return send_file(
-            io.BytesIO(output.getvalue().encode('utf-8')),
+            io.BytesIO(csv_data.encode('utf-8')),
             mimetype='text/csv',
             as_attachment=True,
             download_name=f'neutron_star_{plot_type}_data.csv'
         )
-        
     except Exception as e:
-        print(f"Error in download_csv: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
-
-@app.route('/density_profile', methods=['POST'])
-def density_profile():
-    """Compute density profile rho(r) for selected EOS at a given mass"""
+# ---------------------------------------------------------------------------
+# Start-up: load EOS tables and compile the Numba kernels once.
+# Runs at import time so it also works under gunicorn.
+# ---------------------------------------------------------------------------
+def _warmup():
+    if not eos_cache:
+        return
+    eos = next(iter(eos_cache.values()))
     try:
-        data = request.get_json()
-        selected_eos = data.get('eos', [])
-        target_mass = float(data.get('mass', 1.4))
-
-        if not selected_eos:
-            return jsonify({'error': 'No EOS selected'}), 400
-
-        profiles = []
-
-        for eos_name in selected_eos:
-            if eos_name not in eos_cache:
-                print(f"  Warning: {eos_name} not found in cache")
-                continue
-
-            rho_arr = eos_cache[eos_name]['rho']
-            P_arr = eos_cache[eos_name]['P']
-            color = eos_cache[eos_name]['color']
-
-            print(f"  Computing density profile for {eos_name} at M={target_mass} M☉...")
-
-            # Build M(rho_c) grid to bracket the target mass
-            rho_grid = np.concatenate([
-                np.arange(2.5e14, 1e15, 0.5e13),
-                np.arange(1e15, 4e15, 0.5e14)
-            ])
-            results_grid = solve_all_densities(rho_grid, rho_arr, P_arr)
-            M_grid = results_grid[1, :] / 2e33  # solar masses
-
-            try:
-                rho_c = find_rho_c_for_mass(target_mass, rho_arr, P_arr, (rho_grid, M_grid))
-            except ValueError as e:
-                profiles.append({'name': eos_name, 'error': str(e), 'color': color})
-                continue
-
-            # Integrate TOV to get full profile
-            r_arr, m_arr, rho_profile, R_final, M_final = integrate_tov_profile_v2(
-                rho_c, rho_arr, P_arr
-            )
-
-            profiles.append({
-                'name': eos_name,
-                'color': color,
-                'r_km': (r_arr / 1e5).tolist(),
-                'rho': rho_profile.tolist(),
-                'rho_c': float(rho_c),
-                'R_km': float(R_final / 1e5),
-                'M_solar': float(M_final / 2e33),
-            })
-            print(f"    OK R={R_final/1e5:.2f} km, M={M_final/2e33:.3f} M_sun, rho_c={rho_c:.3e} g/cm3")
-
-        # Build Plotly figure
-        fig = go.Figure()
-        for p in profiles:
-            if 'error' in p:
-                continue
-            fig.add_trace(go.Scatter(
-                x=p['r_km'],
-                y=p['rho'],
-                mode='lines',
-                name=p['name'],
-                line=dict(color=p['color'], width=2),
-                hovertemplate='r = %{x:.2f} km<br>rho = %{y:.3e} g/cm3<extra>%{fullData.name}</extra>'
-            ))
-
-        fig.update_layout(
-            title=f'Density Profile at M = {target_mass} M_sun',
-            xaxis_title='Distance from centre (km)',
-            yaxis_title='Density (g/cm3)',
-            yaxis_type='log',
-            template='plotly_dark'
-        )
-
-        return jsonify({
-            'plot': json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder),
-            'profiles': profiles
-        })
-
-    except Exception as e:
-        print(f"Error in density_profile: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        solve_all_densities(RHO_C_GRID[:4], eos['rho'], eos['P'])
+        tov_profile(5e14, eos['rho'], eos['P'])
+        tov_mass_radius(5e14, eos['rho'], eos['P'])
+    except Exception as e:  # never block start-up; kernels compile on first use instead
+        print(f"Warm-up skipped: {e}")
 
 
-# Initialize the application
+load_eos_data()
+_warmup()
+
 if __name__ == '__main__':
-    print("Starting Neutron Star Solver...")
-    load_eos_data()
-    print("\nApplication ready! Starting Flask server...")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    port = int(os.environ.get('PORT', 5000))
+    print(f"\nApplication ready! Starting Flask server on port {port} (debug={debug})...")
+    app.run(debug=debug, host='0.0.0.0', port=port)
