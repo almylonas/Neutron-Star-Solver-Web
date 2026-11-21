@@ -5,19 +5,25 @@ Run with: python main.py          (development server)
 Access at: http://localhost:5000
 """
 
+import csv
 import io
-import json
 import os
+import tempfile
 import threading
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Serverless hosts (Vercel, AWS Lambda, ...) mount the code read-only and only
+# allow writes to /tmp. Numba's on-disk compile cache would then fail at import
+# ("no locator available"), so point it at the temp dir. Must happen before
+# numba is imported.
+if 'NUMBA_CACHE_DIR' not in os.environ and not os.access(BASE_DIR, os.W_OK):
+    os.environ['NUMBA_CACHE_DIR'] = os.path.join(tempfile.gettempdir(), 'numba_cache')
+
 import numpy as np
-import pandas as pd
 from flask import Flask, render_template, request, jsonify, send_file
 from numba import njit, prange
-from scipy.optimize import brentq
 from werkzeug.utils import secure_filename
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EOS_DIR = os.path.join(BASE_DIR, 'eos')
 
 app = Flask(__name__)
@@ -95,9 +101,33 @@ def _clean_eos(rho, P):
     return np.ascontiguousarray(rho), np.ascontiguousarray(P)
 
 
+def _read_rho_P(text):
+    """
+    Read the 'rho' and 'P' columns of a CSV (other columns are ignored).
+    Blank lines are skipped; unparsable cells become NaN (dropped later).
+    Kept dependency-free (no pandas) to keep the serverless bundle small.
+    """
+    rows = [row for row in csv.reader(io.StringIO(text)) if any(c.strip() for c in row)]
+    if not rows:
+        raise ValueError("Empty file")
+    header = [h.strip() for h in rows[0]]
+    if 'rho' not in header or 'P' not in header:
+        raise ValueError('CSV must have "rho" and "P" columns')
+    i_rho, i_P = header.index('rho'), header.index('P')
+
+    def num(row, i):
+        try:
+            return float(row[i])
+        except (IndexError, ValueError):
+            return np.nan
+
+    data = rows[1:]
+    return (np.array([num(r, i_rho) for r in data], dtype=np.float64),
+            np.array([num(r, i_P) for r in data], dtype=np.float64))
+
+
 def load_eos_data():
     """Load all predefined EOS data"""
-    columns = ["a", "b", "rho", "P"]
     loaded_count = 0
 
     if not os.path.isdir(EOS_DIR):
@@ -111,10 +141,11 @@ def load_eos_data():
             if not os.path.exists(filepath):
                 print(f"  ✗ {filename} - FILE NOT FOUND")
                 continue
-            df = pd.read_csv(filepath, usecols=columns)
+            with open(filepath, encoding='utf-8-sig') as fh:
+                rho, P = _read_rho_P(fh.read())
             if sampling > 1:
-                df = df[1::sampling]
-            rho, P = _clean_eos(df.rho.values, df.P.values)
+                rho, P = rho[1::sampling], P[1::sampling]
+            rho, P = _clean_eos(rho, P)
             eos_cache[name] = {'rho': rho, 'P': P, 'color': color}
             loaded_count += 1
             print(f"  ✓ {filename} - Loaded successfully ({len(rho)} points)")
@@ -324,6 +355,52 @@ def get_curve(eos_name):
     return curve
 
 
+def _brent(f, a, b, tol, maxiter=200):
+    """Brent's method for a root of f in [a, b] (f(a), f(b) of opposite sign).
+    Small stand-in for scipy.optimize.brentq, so scipy is not a dependency."""
+    fa, fb = f(a), f(b)
+    if fa == 0.0:
+        return a
+    if fb == 0.0:
+        return b
+    if fa * fb > 0:
+        raise ValueError("Root is not bracketed")
+    c, fc = a, fa
+    d = e = b - a
+    for _ in range(maxiter):
+        if fb * fc > 0:                       # keep the root between b and c
+            c, fc = a, fa
+            d = e = b - a
+        if abs(fc) < abs(fb):                 # b is the best estimate so far
+            a, b, c = b, c, b
+            fa, fb, fc = fb, fc, fb
+        tol1 = 2.0 * np.finfo(float).eps * abs(b) + 0.5 * tol
+        xm = 0.5 * (c - b)
+        if abs(xm) <= tol1 or fb == 0.0:
+            return b
+        if abs(e) >= tol1 and abs(fa) > abs(fb):
+            s = fb / fa
+            if a == c:                        # secant step
+                p, q = 2.0 * xm * s, 1.0 - s
+            else:                             # inverse quadratic interpolation
+                q, r = fa / fc, fb / fc
+                p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0))
+                q = (q - 1.0) * (r - 1.0) * (s - 1.0)
+            if p > 0:
+                q = -q
+            p = abs(p)
+            if 2.0 * p < min(3.0 * xm * q - abs(tol1 * q), abs(e * q)):
+                e, d = d, p / q               # accept interpolation
+            else:
+                d = e = xm                    # fall back to bisection
+        else:
+            d = e = xm
+        a, fa = b, fb
+        b += d if abs(d) > tol1 else (tol1 if xm > 0 else -tol1)
+        fb = f(b)
+    raise RuntimeError("Brent's method did not converge")
+
+
 def find_rho_c_for_mass(target_mass_solar, eos_name):
     """Central density giving the target mass on the stable branch (ρc ≤ ρc(M_max))."""
     eos = eos_cache[eos_name]
@@ -367,7 +444,7 @@ def find_rho_c_for_mass(target_mass_solar, eos_name):
             # non-monotonic stretch of the curve: fall back to the full stable range
             rho_lo, rho_hi = stable_rho[0], stable_rho[-1]
 
-    return brentq(mass_diff, rho_lo, rho_hi, xtol=1e-10 * rho_hi, rtol=1e-10, maxiter=200)
+    return _brent(mass_diff, rho_lo, rho_hi, tol=1e-10 * rho_hi)
 
 
 def compute_profile(eos_name, mode, value):
@@ -668,11 +745,7 @@ def upload_file():
         return jsonify({'error': 'No file selected'}), 400
 
     try:
-        df = pd.read_csv(file)
-        if 'rho' not in df.columns or 'P' not in df.columns:
-            return jsonify({'error': 'CSV must have "rho" and "P" columns'}), 400
-        rho, P = _clean_eos(pd.to_numeric(df['rho'], errors='coerce').values,
-                            pd.to_numeric(df['P'], errors='coerce').values)
+        rho, P = _clean_eos(*_read_rho_P(file.read().decode('utf-8-sig')))
 
         eos_name = secure_filename(file.filename).replace('.csv', '').upper() or 'CUSTOM'
         with _cache_lock:
