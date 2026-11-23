@@ -604,6 +604,10 @@ def create_plot(results, plot_type, options=None):
                          dict(title=dict(text='ρ (g/cm³)'),
                               type='log' if log_y else 'linear',
                               exponentformat='power'))
+        # Labels are long: put the legend inside the (empty) lower-left corner
+        # instead of beside the plot, so the curves keep the full width.
+        layout['legend'] = dict(x=0.02, y=0.02, xanchor='left', yanchor='bottom',
+                                bgcolor='rgba(17,17,17,0.75)', bordercolor='#283442', borderwidth=1)
         if data:
             layout['shapes'] = [dict(type='line', xref='paper', x0=0, x1=1, yref='y',
                                      y0=RHO_SAT, y1=RHO_SAT,
